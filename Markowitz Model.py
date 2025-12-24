@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import random as rd
 
-
 # We don't have yet the correlation matrix of the currencies so for the moment we will
 # work with a random matrix of dimension 3, to kept the coherence each coefficients of the 
 # matrix will remains in the intevral [0,1] has each coef represent the covariance between
@@ -23,6 +22,6 @@ print(M)
 
 E=np.zeros(3)
 for i in range(3):
-    E[i]=rd.randint(-10,10)
+    E[i]=rd.randint(-0.1,0.1)
 print(E)
 
