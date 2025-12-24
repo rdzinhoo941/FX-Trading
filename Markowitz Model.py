@@ -22,6 +22,18 @@ print(M)
 
 E=np.zeros(3)
 for i in range(3):
-    E[i]=rd.randint(-0.1,0.1)
+    E[i]=rd.random.uniform(-0.1,0.1)
 print(E)
 
+def markowit_optimisation(vec_returns, mat_corr) :
+
+    optimal_weight=np.zeros(len(vec_returns))
+    optimal_weight= 1/(len(vec_returns))
+
+    return optimal_weight
+
+def objective_function(mat_corr, weight_vector):
+    t_weight=np.transpose(weight_vector)
+    result= np.dot(t_weight,mat_corr)
+    result=np.dot(result,weight_vector)
+    return result
