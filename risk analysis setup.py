@@ -20,16 +20,16 @@ def create_master_dataframe(pairs):
         
         if os.path.exists(filename):
             try:
-                # 1. Lecture brute
+                # 1. Lecture
                 df = pd.read_csv(filename, index_col=0)
                 
-                # 2. Nettoyage Index (Dates)
+                # 2. Nettoyage Index
                 df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
                 df = df[df.index.notnull()]
                 df.index = df.index.tz_localize(None)
                 df = df[~df.index.duplicated(keep='last')]
 
-                # 3. Extraction de la colonne Prix
+                # 3. Extraction Prix
                 col_name = 'Close'
                 if 'Close' not in df.columns and 'Adj Close' in df.columns:
                     col_name = 'Adj Close'
@@ -38,6 +38,7 @@ def create_master_dataframe(pairs):
                     series = df[col_name]
                     series.name = pair
                     
+                    # On utilise join outer pour garder TOUTES les dates de TOUS les fichiers
                     if master_df.empty:
                         master_df = pd.DataFrame(series)
                     else:
@@ -47,18 +48,25 @@ def create_master_dataframe(pairs):
         else:
             print(f"Fichier manquant : {filename}")
 
-    # --- CORRECTION CRITIQUE ICI ---
-    # On force tout le tableau à devenir des NOMBRES (Floats).
-    # Si une case contient encore du texte caché, elle devient NaN (Not a Number)
+    # Conversion en numérique
     master_df = master_df.apply(pd.to_numeric, errors='coerce')
 
-    # Nettoyage final
+    # Tri par date
     master_df = master_df.sort_index()
-    master_df = master_df.ffill().dropna()
+
+    # --- CORRECTION ICI ---
+    # 1. On coupe tout ce qui est avant l'an 2000 (pour éviter de remonter à 1970 inutilement)
+    master_df = master_df[master_df.index >= '2000-01-01']
+
+    # 2. On remplit les petits trous (jours fériés) avec la valeur précédente
+    master_df = master_df.ffill()
+    
+    # 3. IMPORTANT : On NE FAIT PAS dropna() global.
+    # On accepte que certaines colonnes aient des NaN au début (années 2000-2015)
+    # si la devise n'existait pas encore.
     
     print(f"\nMatrice terminée : {master_df.shape[0]} jours x {master_df.shape[1]} devises")
     return master_df
-
 # --- EXÉCUTION ---
 if __name__ == "__main__":
     # 1. Récupération des PRIX
@@ -67,8 +75,7 @@ if __name__ == "__main__":
     if not df_prices.empty:
         # 2. Calcul des RENDEMENTS (Returns)
         # Maintenant que ce sont des nombres, le calcul va marcher
-        df_returns = df_prices.pct_change().dropna()
-        
+        df_returns = df_prices.pct_change()        
         print("\n--- Aperçu des Prix (df_prices) ---")
         print(df_prices.tail())
         
