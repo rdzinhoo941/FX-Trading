@@ -10,8 +10,8 @@ warnings.filterwarnings("ignore")
 # --- PARAMÈTRES ---
 TARGET_BUDGET = 1000000.0  
 RISK_AVERSION = 2.5     
-pairs_list_raw = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
-#pairs_list_raw = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD","CHFJPY", "EURJPY", "EURAUD", "GBPAUD", "CADJPY", "NZDJPY", "EURCAD", "GBPCAD","USDTRY", "USDINR", "USDBRL", "USDZAR", "USDSEK"]
+#pairs_list_raw = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
+pairs_list_raw = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD","CHFJPY", "EURJPY", "EURAUD", "GBPAUD", "CADJPY", "NZDJPY", "EURCAD", "GBPCAD","USDTRY", "USDINR", "USDBRL", "USDZAR", "USDSEK"]
 tickers = [f"{pair}=X" for pair in pairs_list_raw]
 benchmark_ticker = "DX-Y.NYB"
 
@@ -38,16 +38,22 @@ train_data = returns_daily.loc[:start_test_date]
 test_data = returns_daily.loc[start_test_date:]
 
 # --- 2. OPTIMISATION MARKOWITZ ---
-def optimize_markowitz(mu, sigma, risk_aversion):
+def optimize_markowitz(mu, sigma, risk_aversion, max_leverage=1.5):
     num_assets = len(mu)
     init_guess = np.repeat(1/num_assets, num_assets)
     
     def objective(weights):
-        # Utility = Returns - (Risk_Aversion * Variance / 2)
         utility = (np.dot(weights, mu) * 252) - (risk_aversion / 2) * (np.dot(weights.T, np.dot(sigma, weights)) * 252)
         return -utility
 
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0})
+    # Contrainte 1 : Somme nette = 100% (Budget investi)
+    cons_net = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}
+    
+    # Contrainte 2 : Somme des valeurs absolues <= Levier Max (ex: 1.5 ou 2.0)
+    # C'est LA contrainte qui empêche l'algo de tricher
+    cons_gross = {'type': 'ineq', 'fun': lambda x: max_leverage - np.sum(np.abs(x))}
+    
+    constraints = [cons_net, cons_gross]
     bounds = tuple((-1.0, 1.0) for _ in range(num_assets))
     
     result = minimize(objective, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
