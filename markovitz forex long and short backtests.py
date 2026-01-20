@@ -164,25 +164,35 @@ for year in YEARS_TO_TEST:
         # C'est ici que ça se joue. On ne rebalance PAS tous les jours pour gagner du temps ? 
         # NON, tu as demandé du Daily. On fait du Daily.
         
+        # --- BOUCLE JOUR PAR JOUR (CORRIGÉE) ---
         for i in range(len(trading_days) - 1):
             curr_date = trading_days[i]
             next_date = trading_days[i+1]
             
-            # 1. Calcul des données historiques (Mu, Sigma) -> FAIT UNE SEULE FOIS PAR JOUR
-            # On prend les 'win_days' derniers jours
-            hist_data = returns_total.loc[:curr_date].tail(win_days)
+            # 1. Calcul des données historiques
+            # CORRECTION : On prend les données jusqu'à curr_date, 
+            # MAIS on exclut la dernière ligne (.iloc[:-1]) car c'est la journée qu'on va trader !
+            # On veut décider le matin en ne connaissant que la veille.
             
-            # Sécurité : Si pas assez d'historique (ex: début 2020 avec fenêtre 2 ans)
-            if len(hist_data) < win_days * 0.9: 
+            full_history = returns_total.loc[:curr_date].iloc[:-1] 
+            hist_data = full_history.tail(win_days)
+            
+            # Sécurité : Si pas assez d'historique (ex: début 2020)
+            if len(hist_data) < win_days: 
                 continue 
             
+            # Si la fenêtre est trop courte par rapport au nombre d'actifs (ex: 20 paires, fenêtre 1 mois)
+            # La matrice de covariance explose. On saute si c'est mathématiquement instable.
+            if len(hist_data) < len(tickers) + 2:
+                continue
+
             mu = hist_data.mean()
             sigma = hist_data.cov()
             
-            # Rendement du marché pour le jour suivant (vecteur)
-            day_returns = returns_total.loc[curr_date:next_date].sum() # approx du jour
+            # Rendement du marché pour le jour suivant (Ce qu'on essaie de capturer)
+            day_returns = returns_total.loc[curr_date:next_date].sum()
             
-            # 2. Boucle sur les Leviers (Calcul des poids et mise à jour)
+            # 2. Boucle sur les Leviers
             for lev in LEVERAGES:
                 # Optimisation
                 w = get_optimal_weights(mu, sigma, RISK_AVERSION, max_leverage=lev)
