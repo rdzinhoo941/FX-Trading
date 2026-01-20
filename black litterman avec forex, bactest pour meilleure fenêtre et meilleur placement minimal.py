@@ -11,10 +11,8 @@ RISK_AVERSION = 2.5
 TAU = 0.05              
 CONFIDENCE_LEVEL = 0.95 
 
-# Liste des paires MAJEURES uniquement (Plus stable, moins de frais cachés)
 pairs_list_raw = [
-    "EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", 
-    "NZDUSD", "EURJPY", "GBPJPY", "EURGBP"
+    "EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURJPY"#, "GBPJPY", "EURGBP"
 ]
 FOREX_TICKERS = [f"{p}=X" for p in pairs_list_raw]
 BENCHMARK_TICKER = "DX-Y.NYB" 
@@ -62,9 +60,10 @@ def get_covariance_sim(asset_returns, benchmark_returns):
     return pd.DataFrame(sim_cov, index=asset_returns.columns, columns=asset_returns.columns)
 def optimize_black_litterman(prices_train, prices_bench_train):
     """
-    Version LONG / SHORT TACTIQUE :
-    - Si Tendance Hausse (Prix > Moyenne) : Vue Positive -> Achat
-    - Si Tendance Baisse (Prix < Moyenne) : Vue Négative -> Vente (Short)
+    Version RSI MEAN REVERSION (Contrarienne Pure) :
+    - RSI > 70 (Surachat) -> VENTE (Short)
+    - RSI < 30 (Survente) -> ACHAT (Long)
+    - Parfait pour les marchés en range.
     """
     valid = prices_train.dropna(axis=1, how='any')
     if valid.shape[1] < 2: return None
@@ -72,50 +71,56 @@ def optimize_black_litterman(prices_train, prices_bench_train):
     returns = valid.pct_change(fill_method=None).dropna()
     if returns.empty: return None
 
-    # --- 1. PARAMÈTRES BL ---
-    recent_returns = returns.tail(252) 
-    cov_mat_annual = recent_returns.cov() * 252
+    # 1. Paramètres de Risque (Covariance)
+    # On prend tout l'historique disponible pour la stabilité
+    cov_mat_annual = returns.cov() * 252
     
     n_assets = len(returns.columns)
     risk_aversion = 2.5
     tau = 0.05
     
-    # Equilibrium : On part neutre (0 partout) au lieu de 1/N
-    # Car en Long/Short, le marché neutre n'est pas "tout acheter"
     weights_eq = np.zeros((n_assets, 1))
     pi = risk_aversion * cov_mat_annual.dot(weights_eq)
 
-    # --- 2. VUES (Tendance Long/Short) ---
-    current_prices = valid.iloc[-1]
-    # Moyenne Mobile 100 jours pour la tendance
-    sma = valid.rolling(window=100).mean().iloc[-1]
-    
+    # 2. VUES (RSI 14 Périodes)
     pick_matrix = []   
     view_returns = [] 
     view_confidences = []
 
+    # Calcul RSI Vectorisé (plus rapide et sûr)
+    delta = valid.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean().iloc[-1]
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean().iloc[-1]
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+
     for i, asset in enumerate(returns.columns):
-        if pd.isna(sma[asset]): continue
+        if pd.isna(rsi[asset]): continue
         
-        # Force du signal : (Prix - Moyenne) / Moyenne
-        # Si positif = Hausse, Si négatif = Baisse
-        trend_strength = (current_prices[asset] / sma[asset]) - 1
+        rsi_val = rsi[asset]
+        signal = 0.0
         
-        # On ne joue que si la tendance est un minimum marquée (> 0.5% d'écart)
-        if abs(trend_strength) > 0.005:
+        # Logique Contrarienne RSI
+        if rsi_val > 70: # Suroptimisme -> On Short
+            # Plus on est haut, plus on short fort
+            signal = -1.0 * (rsi_val - 70) / 30.0 
+        elif rsi_val < 30: # Pessimisme -> On Achète
+            signal = 1.0 * (30 - rsi_val) / 30.0
+            
+        # Filtre : On ne joue que si le signal est significatif
+        if abs(signal) > 0.1:
             p_row = np.zeros(n_assets)
             p_row[i] = 1 
             pick_matrix.append(p_row)
             
-            # Projection : on espère capter ce momentum
-            # On amplifie un peu le signal pour la vue (x2)
-            expected_ret = np.clip(trend_strength * 2.0, -0.40, 0.40)
+            # Vue : 20% de retour espéré si le signal est max (1.0)
+            expected_ret = np.clip(signal * 0.20, -0.20, 0.20)
             view_returns.append(expected_ret)
             
             asset_vol = np.sqrt(cov_mat_annual.iloc[i, i])
             view_confidences.append((asset_vol * tau) ** 2)
 
-    # --- 3. CALCUL BL ---
+    # 3. Calcul BL
     if len(pick_matrix) > 0:
         P = np.array(pick_matrix)
         Q = np.array(view_returns).reshape(-1, 1)
@@ -134,33 +139,25 @@ def optimize_black_litterman(prices_train, prices_bench_train):
         except:
             bl_returns = pi.flatten()
     else:
-        # Pas de tendance claire nulle part -> Cash
-        return None
+        return None # Pas de signal extrême -> Cash
 
-    # --- 4. OPTIMISATION LONG/SHORT ---
+    # 4. Optimisation
     def neg_sharpe(w):
         p_ret = np.sum(bl_returns * w)
         p_vol = np.sqrt(np.dot(w.T, np.dot(cov_mat_annual, w)))
         if p_vol < 1e-6: return 0
         return - (p_ret) / p_vol
 
-    # Contrainte : Somme des valeurs ABSOLUES = 1 (Gross Exposure = 100%)
-    # Cela veut dire qu'on utilise tout le capital, soit en achat, soit en short.
-    # Ex: 50% Long EURUSD + 50% Short GBPUSD = 100% exposé.
     cons = ({'type': 'eq', 'fun': lambda x: np.sum(np.abs(x)) - 1})
-    
-    # Bornes : On peut aller de -100% (Short total) à +100% (Long total) par actif
     bounds = tuple((-1.0, 1.0) for _ in range(n_assets)) 
     
     try:
-        # Initial guess : on suit le signe des retours espérés
-        # Si BL prévoit positif -> on commence positif, sinon négatif
         init_guess = np.sign(bl_returns) * (1/n_assets)
+        if np.all(init_guess == 0): init_guess = [1/n_assets] * n_assets
         res = minimize(neg_sharpe, init_guess, method='SLSQP', bounds=bounds, constraints=cons)
         return pd.Series(res.x, index=returns.columns).sort_values(ascending=False)
     except:
         return None
-    
 def clean_portfolio(allocations, threshold):
     if allocations is None: return None
     # On garde si la valeur ABSOLUE est supérieure au seuil
@@ -182,7 +179,7 @@ def calculate_risk_metrics(returns_series, confidence=0.95):
     return var, cvar
 # --- 4. GRID SEARCH HYPER-PARAMÈTRES (2010-2022) ---
 
-def backtest_parameters(window_y, threshold_pct, start_y=2010, end_y=2022):
+def backtest_parameters(window_y, threshold_pct, start_y=2010, end_y=2020):
     """ Simule la stratégie avec prise en compte du Spread (Frais) """
     capital = 100.0
     current_year = start_y
@@ -255,210 +252,123 @@ SEUIL_FILTRE = best_params[1]
 # --- 5. BACKTEST VISUEL ENGINE (Adapté) ---
 
 def run_scenario(scenario_id, name, start_year, end_year):
-    print(f"\n[{scenario_id}] {name}...")
-    periods = []
-    current_year = start_year
-    while current_year <= end_year:
-        periods.append((f"{current_year}-01-01", f"{current_year}-12-31"))
-        current_year += 1
-            
-    cols = 3
-    rows = math.ceil(len(periods) / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 3 * rows))
-    fig.canvas.manager.set_window_title(name)
-    fig.suptitle(name, fontsize=14, fontweight='bold', color='darkblue')
-    axs_flat = axes.flatten()
-    plot_idx = 0
+    print(f"\n[{scenario_id}] {name} (Rebalancement Hebdomadaire)...")
     
+    # --- PRÉPARATION TEMPORELLE ---
+    # On génère les dates de rebalancement (Tous les Vendredis)
+    # On prend large sur les dates pour couvrir la période
+    full_dates = prices_bench.loc[f"{start_year}-01-01":f"{end_year}-12-31"].index
+    if full_dates.empty: return
+    
+    # On crée une série temporelle hebdomadaire
+    weekly_dates = prices_bench.loc[full_dates[0]:full_dates[-1]].resample('W-FRI').last().index
+    
+    # Capitaux (Base 100 USD pour simplifier la comparaison)
     cap_strat = 100.0
     cap_bench = 100.0
-    risk_audit = [] 
     
-    print(f"{'ANNÉE':<6} | {'BENCH':<8} | {'STRAT':<8} | {'VaR 95%':<8} | {'CVaR 95%':<9} | {'TOP POSITIONS':<30}")
-    print("-" * 120)
+    # Pour le graphique
+    dates = [weekly_dates[0]]
+    strat_curve = [100.0]
+    bench_curve = [100.0]
     
-    for start_test, end_test in periods:
-        bench_slice = prices_bench.loc[start_test:end_test]
-        if bench_slice.empty: continue
-        
-        b_rets = bench_slice.pct_change(fill_method=None).dropna()
-        per_bench = (1 + b_rets).prod() - 1
-        cap_bench *= (1 + per_bench)
-        
-        test_start_dt = pd.Timestamp(start_test)
-        start_train = test_start_dt - pd.DateOffset(months=int(WINDOW_YEARS * 12))
-        end_train = test_start_dt - pd.DateOffset(days=1)
-        
-        # Données Training
-        train_data = data.loc[start_train:end_train]
-        bench_train = prices_bench.loc[start_train:end_train]
-        
-        # APPEL A L'OPTIMISEUR BL
-        alloc = optimize_black_litterman(train_data, bench_train)
-        
-        if alloc is not None:
-            alloc = clean_portfolio(alloc, SEUIL_FILTRE)
-        if alloc is None:
-            # CAS 1 : Tout baisse, on reste en CASH (Performance = 0%)
-            daily_perf = pd.Series(0.0, index=b_rets.index)
-            top_holdings_str = "🛑 100% CASH (Tendance Baissière)"
-            var_forecast, cvar_forecast = 0.0, 0.0
-            
-            # Mise à jour graphique
-            cap_strat *= 1.0 # Le capital ne bouge pas
-            curve_s = pd.Series(cap_strat, index=b_rets.index).tolist() # Ligne plate
-            
-             # On force la création de listes pour le plot même si c'est plat
-            period_strat_curve = [cap_strat] * len(b_rets)
-            period_bench_curve = (1 + b_rets).cumprod() * cap_bench # Le bench continue de bouger
-            period_bench_curve = period_bench_curve.tolist()
-            period_dates = b_rets.index
-            
-            # On met à jour cap_bench pour le tour suivant
-            cap_bench *= (1 + ((1 + b_rets).prod() - 1))
-            
-            per_bench_abs = (1 + b_rets).prod() - 1
-            per_strat_abs = 0.0
-            
-        else:
-            # CAS 2 : On est investi
-            alloc = clean_portfolio(alloc, SEUIL_FILTRE)
-            # --- MODIF AFFICHAGE LONG/SHORT ---
-            longs = alloc[alloc > 0].sort_values(ascending=False).head(2)
-            shorts = alloc[alloc < 0].sort_values().head(2)
-            
-            txt_l = " ".join([f"L:{t.replace('=X','')}({w*100:.0f}%)" for t, w in longs.items()])
-            txt_s = " ".join([f"S:{t.replace('=X','')}({w*100:.0f}%)" for t, w in shorts.items()])
-            top_holdings_str = f"{txt_l} | {txt_s}"
-            
-            # Prévision Risque (sur train data)
-            train_prices_alloc = train_data[alloc.index]
-            train_rets_alloc = train_prices_alloc.pct_change(fill_method=None).dropna()
-            train_port_rets = train_rets_alloc.dot(alloc.values)
-            var_forecast, cvar_forecast = calculate_risk_metrics(train_port_rets, CONFIDENCE_LEVEL)
-
-            # Test Réel
-            test_prices = data.loc[start_test:end_test, alloc.index]
-            s_rets = test_prices.pct_change(fill_method=None).dropna()
-            common_idx = s_rets.index.intersection(b_rets.index)
-            
-            if len(common_idx) > 0:
-                s_rets = s_rets.loc[common_idx]
-                b_rets_aligned = b_rets.loc[common_idx]
-                
-                # Performance Stratégie
-                daily_perf = s_rets.dot(alloc.values)
-                
-                # PAS DE FRAIS (Supprimés comme demandé)
-                # if not daily_perf.empty: daily_perf.iloc[0] -= 0.0005 
-                
-                per_strat = (1 + daily_perf).prod() - 1
-                cap_strat *= (1 + per_strat)
-                
-                # Mise à jour Bench
-                per_bench = (1 + b_rets_aligned).prod() - 1
-                cap_bench *= (1 + per_bench)
-                
-                # Courbes
-                curve_s = (1 + daily_perf).cumprod() * (cap_strat / (1+per_strat))
-                curve_b = (1 + b_rets_aligned).cumprod() * (cap_bench / (1+per_bench))
-                
-                period_strat_curve = curve_s.tolist()
-                period_bench_curve = curve_b.tolist()
-                period_dates = common_idx
-                
-                per_strat_abs = per_strat
-                per_bench_abs = per_bench
-
-        period_strat_curve = []
-        period_bench_curve = []
-        period_dates = []
-        
-        var_forecast = np.nan
-        cvar_forecast = np.nan
-        top_holdings_str = "CASH"
-        
-        if alloc is not None:
-            top3 = alloc.head(3)
-            # Affichage nettoyé du suffixe =X pour la lisibilité
-# On prend les 2 plus gros achats ET les 2 plus gros shorts
-            shorts = alloc[alloc < -0.05].sort_values().head(2)
-            longs = alloc[alloc > 0.05].sort_values(ascending=False).head(2)
-
-            txt_long = " ".join([f"Long {t.replace('=X','')}({w*100:.0f}%)" for t, w in longs.items()])
-            txt_short = " ".join([f"Short {t.replace('=X','')}({w*100:.0f}%)" for t, w in shorts.items()])
-            top_holdings_str = f"{txt_long} | {txt_short}"            
-            # Prévision Risque
-            train_prices_alloc = train_data[alloc.index]
-            train_rets_alloc = train_prices_alloc.pct_change(fill_method=None).dropna()
-            train_port_rets = train_rets_alloc.dot(alloc.values)
-            var_forecast, cvar_forecast = calculate_risk_metrics(train_port_rets, CONFIDENCE_LEVEL)
-            
-            # Test Réel
-            test_prices = data.loc[start_test:end_test, alloc.index]
-            s_rets = test_prices.pct_change(fill_method=None).dropna()
-            common_idx = s_rets.index.intersection(b_rets.index)
-            
-            if len(common_idx) > 0:
-                s_rets = s_rets.loc[common_idx]
-                b_rets_aligned = b_rets.loc[common_idx]
-                daily_perf = s_rets.dot(alloc.values)
-                
-                # Audit Risk
-                worst_loss = daily_perf.min()
-                breach_var = daily_perf[daily_perf < var_forecast]
-                pct_breach = len(breach_var) / len(daily_perf) if len(daily_perf) > 0 else 0
-                
-                year_start = int(start_test[:4])
-                if year_start >= 2021:
-                    risk_audit.append({
-                        "Period": f"{start_test[:4]}",
-                        "Pred_VaR": var_forecast,
-                        "Pred_CVaR": cvar_forecast,
-                        "Real_Worst": worst_loss,
-                        "Breach_Pct": pct_breach,
-                        "Status": "FAIL" if pct_breach > (1-CONFIDENCE_LEVEL) else "OK"
-                    })
-
-                per_strat = (1 + daily_perf).prod() - 1
-                cap_strat *= (1 + per_strat)
-                
-                curve_s = (1 + daily_perf).cumprod() * 100
-                curve_b = (1 + b_rets_aligned).cumprod() * 100
-                period_strat_curve = curve_s.tolist()
-                period_bench_curve = curve_b.tolist()
-                period_dates = common_idx
-
-        per_bench_abs = per_bench
-        per_strat_abs = per_strat if alloc is not None else 0
-        sign = "✅" if per_strat_abs > per_bench_abs else "🔻"
-        
-        print(f"{start_test[:4]:<6} | {per_bench_abs*100:+.1f}%   | {per_strat_abs*100:+.1f}% {sign} | {var_forecast*100:.1f}%    | {cvar_forecast*100:.1f}%     | {top_holdings_str}")
-        
-        if plot_idx < len(axs_flat) and len(period_strat_curve) > 0:
-            ax = axs_flat[plot_idx]
-            ax.plot(period_dates, period_strat_curve, color='blue', linewidth=1.5)
-            ax.plot(period_dates, period_bench_curve, color='gray', linestyle='--', alpha=0.7)
-            col_tit = 'blue' if per_strat_abs > per_bench_abs else 'black'
-            ax.set_title(f"{start_test[:4]} : {per_strat_abs*100:+.1f}% vs {per_bench_abs*100:+.1f}%", color=col_tit, fontsize=9, fontweight='bold')
-            ax.xaxis.set_visible(False)
-            ax.grid(True, alpha=0.3)
-            plot_idx += 1
-            
-    for j in range(plot_idx, len(axs_flat)): fig.delaxes(axs_flat[j])
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    current_alloc = None
     
-    print("-" * 120)
-    print(f"BILAN : Stratégie {cap_strat:.0f} € vs Bench (USD Index) {cap_bench:.0f} €")
-    
-    if len(risk_audit) > 0:
-        print("\n>>> AUDIT DE RISQUE AVANCÉ (VaR vs CVaR)")
-        print(f"{'Année':<8} | {'VaR (Seuil)':<12} | {'CVaR (Crash)':<13} | {'Pire Jour':<12} | {'Analyse'}")
-        for r in risk_audit:
-            cvar_breach = "⚠️ >CVaR" if r['Real_Worst'] < r['Pred_CVaR'] else "OK"
-            print(f"{r['Period']:<8} | {r['Pred_VaR']*100:.2f}%      | {r['Pred_CVaR']*100:.2f}%       | {r['Real_Worst']*100:.2f}%      | {r['Status']} / {cvar_breach}")
+    print(f"{'DATE':<12} | {'BENCH':<8} | {'STRAT':<8} | {'TOP POSITIONS (Long/Short)'}")
+    print("-" * 100)
+
+    # BOUCLE SEMAINE PAR SEMAINE
+    for i in range(len(weekly_dates) - 1):
+        curr_date = weekly_dates[i]
+        next_date = weekly_dates[i+1]
+        
+        # --- A. OPTIMISATION (Le Cerveau) ---
+        # On regarde le passé (Fenetre glissante définie par WINDOW_YEARS)
+        train_start = curr_date - pd.DateOffset(months=int(WINDOW_YEARS * 12))
+        
+        # Données d'entraînement s'arrêtant STRICTEMENT à la date actuelle (pas de biais futur)
+        train_data = data.loc[train_start:curr_date]
+        bench_train = prices_bench.loc[train_start:curr_date]
+        
+        # On recalcule les poids optimaux pour la semaine à venir
+        # On utilise ta fonction optimize_black_litterman existante
+        new_alloc = optimize_black_litterman(train_data, bench_train)
+        
+        if new_alloc is not None:
+            # On nettoie et on applique
+            current_alloc = clean_portfolio(new_alloc, SEUIL_FILTRE)
+        
+        # --- B. SIMULATION (Le Réel) ---
+        # On regarde ce qui se passe la semaine suivante
+        week_prices = data.loc[curr_date:next_date]
+        bench_prices = prices_bench.loc[curr_date:next_date]
+        
+        if week_prices.empty or len(week_prices) < 2: continue
+        
+        # Rendement de la semaine (Prix Fin / Prix Début - 1)
+        # Benchmark
+        b_ret = (bench_prices.iloc[-1] / bench_prices.iloc[0]) - 1
+        cap_bench *= (1 + b_ret)
+        
+        # Stratégie
+        s_ret = 0.0
+        pos_str = "CASH"
+        
+        if current_alloc is not None:
+            # Rendement de chaque actif durant la semaine
+            asset_rets = (week_prices.iloc[-1] / week_prices.iloc[0]) - 1
             
-    print("=" * 120)
+            # Alignement des index pour le produit scalaire
+            common = asset_rets.index.intersection(current_alloc.index)
+            if not common.empty:
+                # Performance = Somme (Poids * Rendement)
+                # Note: Si Poids est négatif (Short) et Rendement négatif (Baisse), on gagne (+)
+                s_ret = asset_rets[common].dot(current_alloc[common])
+                
+                # --- COSMETIQUE (Affichage) ---
+                longs = current_alloc[current_alloc > 0.1].index.tolist()
+                shorts = current_alloc[current_alloc < -0.1].index.tolist()
+                
+                l_txt = " ".join([t.replace('=X','') for t in longs[:2]])
+                s_txt = " ".join([t.replace('=X','') for t in shorts[:2]])
+                
+                if l_txt or s_txt:
+                    pos_str = f"L:[{l_txt}] S:[{s_txt}]"
+                else:
+                    pos_str = "Div." # Diversifié
+
+        # Mise à jour Capital Stratégie
+        cap_strat *= (1 + s_ret)
+        if 'high_water_mark' not in locals(): high_water_mark = 100.0
+        
+        if cap_strat > high_water_mark:
+            high_water_mark = cap_strat
+            
+        drawdown = (cap_strat - high_water_mark) / high_water_mark
+        
+        # Si on perd plus de 5% depuis le sommet -> Sécurité CASH
+        if drawdown < -0.05:
+            pos_str += " [⚠️ DD > 5%]"
+        # Stockage
+        strat_curve.append(cap_strat)
+        bench_curve.append(cap_bench)
+        dates.append(next_date)
+        
+        # Affichage une fois par mois pour ne pas saturer la console (toutes les 4 semaines)
+        if i % 4 == 0:
+            print(f"{curr_date.date()} | {cap_bench:<8.1f} | {cap_strat:<8.1f} | {pos_str}")
+
+    print("-" * 100)
+    print(f"FINAL : Stratégie {cap_strat:.1f} $ vs Benchmark {cap_bench:.1f} $")
+    
+    # Graphique final
+    plt.figure(figsize=(12, 6))
+    plt.plot(dates, strat_curve, label='Stratégie (Weekly Rebal.)', color='blue', linewidth=1.5)
+    plt.plot(dates, bench_curve, label='Benchmark (DXY)', color='gray', linestyle='--', alpha=0.7)
+    plt.title(f"Performance Hebdomadaire : {start_year}-{end_year}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
 
 # --- 6. OPTIMISEUR ENTIER (LOGIQUE CONSERVÉE) ---
 def smart_integer_optimizer(allocation, current_prices, target_budget):
@@ -466,6 +376,9 @@ def smart_integer_optimizer(allocation, current_prices, target_budget):
     results = []
     tickers = allocation.index.tolist()
     target_weights = allocation.values
+    
+    # On calcule les montants idéaux en Valeur Absolue pour respecter l'exposition
+    # Si le poids est négatif, le montant sera négatif
     ideal_amounts = target_weights * target_budget
     ideal_shares = ideal_amounts / current_prices[tickers].values
     
@@ -473,113 +386,106 @@ def smart_integer_optimizer(allocation, current_prices, target_budget):
     for share_count in ideal_shares:
         floor_s = math.floor(share_count)
         ceil_s = math.ceil(share_count)
-        if floor_s == 0 and share_count > 0.1:
-            ranges.append([1]) # Forcer au moins 1 unité
+        # Gestion du cas zéro ou proche de zéro
+        if abs(share_count) < 0.1:
+             ranges.append([0])
         else:
             ranges.append(list(set([floor_s, ceil_s])))
     
-    # Si trop complexe, arrondi simple
+    # Si trop de combinaisons, on arrondit simplement (fallback)
     if len(ranges) > 12:
          shares = np.round(ideal_shares)
-         total_cost = np.sum(shares * current_prices[tickers].values)
-         return {"shares": shares, "cost": total_cost, "score": 0}
+         # Calcul de l'exposition brute (Somme des valeurs absolues)
+         total_exposure = np.sum(np.abs(shares * current_prices[tickers].values))
+         return {"shares": shares, "cost": total_exposure, "score": 0}
 
     for combination in itertools.product(*ranges):
         shares = np.array(combination)
-        total_cost = np.sum(shares * current_prices[tickers].values)
-        if total_cost < target_budget * 0.8 or total_cost > target_budget * 1.2: continue
+        # C'EST ICI LA CORRECTION : On somme les valeurs ABSOLUES
+        gross_exposure = np.sum(np.abs(shares * current_prices[tickers].values))
         
-        real_weights = (shares * current_prices[tickers].values) / total_cost
+        # On vérifie qu'on est proche du budget en exposition (levier 1)
+        if gross_exposure < target_budget * 0.95 or gross_exposure > target_budget * 1.05: continue
+        
+        # Poids réels basés sur l'exposition brute
+        real_weights = (shares * current_prices[tickers].values) / gross_exposure
+        
+        # Erreur par rapport aux poids cibles (en valeur absolue aussi)
         weight_error = np.sum(np.abs(real_weights - target_weights))
-        budget_error = abs(total_cost - target_budget) / target_budget
+        budget_error = abs(gross_exposure - target_budget) / target_budget
+        
         score = (2.0 * weight_error) + (1.0 * budget_error)
         
-        results.append({"shares": shares, "cost": total_cost, "score": score, "real_weights": real_weights})
+        results.append({"shares": shares, "cost": gross_exposure, "score": score, "real_weights": real_weights})
         
     if not results: return None
     return sorted(results, key=lambda x: x["score"])[0]
-
 # --- 7. EXÉCUTION ---
 print("4. LANCEMENT DU BACKTEST AVEC PARAMÈTRES OPTIMISÉS...")
 
 # On lance uniquement sur la période récente (2023-2025) car 2005-2022 a servi à l'entrainement des paramètres
 scenarios_list = [
-    {"id": 1, "years": (2023, 2025), "desc": f"FOREX | Window={WINDOW_YEARS}y | Filtre={SEUIL_FILTRE*100:.0f}%"}
+    {"id": 1, "years": (2021, 2025), "desc": f"FOREX | Window={WINDOW_YEARS}y | Filtre={SEUIL_FILTRE*100:.0f}%"}
 ]
 
 for s in scenarios_list:
     run_scenario(s["id"], s["desc"], s["years"][0], s["years"][1])
-
 # --- 8. PRÉVISIONS 2026 ---
 print("\n" + "█"*80)
 print(f"🔮 PRÉVISIONS 2026 : BL + SIM (Optimisé Forex)")
 print("█"*80)
 
+# Pour les prévisions live, on utilise les données jusqu'à la fin
 end_train_26 = last_date
 start_train_26 = last_date - pd.DateOffset(months=int(WINDOW_YEARS * 12))
 train_data_26 = data.loc[start_train_26:end_train_26]
 bench_train_26 = prices_bench.loc[start_train_26:end_train_26]
 
-# Appel Optimiseur BL
 alloc_base = optimize_black_litterman(train_data_26, bench_train_26)
 
 if alloc_base is not None:
-    budget = TARGET_BUDGET
-    alloc_conviction = clean_portfolio(alloc_base, SEUIL_FILTRE)
+    # On filtre un peu plus fort pour les ordres réels (éviter les micro-positions)
+    alloc_conviction = clean_portfolio(alloc_base, 0.02) 
     
     if alloc_conviction is not None:
-        
-        # --- DASHBOARD DE RISQUE 2026 ---
-        train_prices_alloc = train_data_26[alloc_conviction.index]
-        train_port_26 = train_prices_alloc.pct_change(fill_method=None).dropna().dot(alloc_conviction.values)
-        p_var_26, p_cvar_26 = calculate_risk_metrics(train_port_26, CONFIDENCE_LEVEL)
-        p_vol_26 = train_port_26.std() * np.sqrt(252)
-        p_ret_26 = train_port_26.mean() * 252
-        
-        print(f"\n📊 DASHBOARD RISQUE (Window {WINDOW_YEARS} ans)")
-        print("-" * 50)
-        print(f"   Rendement Espéré (Hist) : {p_ret_26*100:.1f}%")
-        print(f"   Volatilité Annuelle     : {p_vol_26*100:.1f}%")
-        print(f"   VaR 95% (Jour)          : {p_var_26*100:.2f}%")
-        print(f"   CVaR 95% (Jour)         : {p_cvar_26*100:.2f}%")
-        print("-" * 50)
-        
-        print(f"\nA. PORTEFEUILLE CIBLE")
-        print("-" * 75)
-        for t, w in alloc_conviction.items():
-            price = data[t].iloc[-1]
-            print(f"   👉 {t.replace('=X',''):<10} | {w*100:.3f}%      | {budget*w:.0f} €          | {price:.4f}")
-    
         current_prices = data.iloc[-1][alloc_conviction.index]
+        
+        # Calcul du plan en Dollars (USD) car c'est la monnaie de référence Forex
         best_plan = smart_integer_optimizer(alloc_conviction, current_prices, TARGET_BUDGET)
         
         print("\n" + "█"*80)
-        print(f"C. PLAN D'ACHAT (Unités) 2026 (Budget ~{TARGET_BUDGET}€)")
+        print(f"C. PLAN D'ACHAT (Unités) 2026 (Budget ~{TARGET_BUDGET}$)")
         print("█"*80)
         
         if best_plan:
-            print(f"   Coût Total : {best_plan['cost']:.2f} €")
-            print("-" * 80)
-            print(f"{'PAIRE':<10} | {'COURS':<12} | {'UNITÉS':<10} | {'MONTANT':<12} | {'POIDS'}")
-            print("-" * 80)
+            print(f"   Exposition Totale : {best_plan['cost']:.2f} $")
+            print("-" * 90)
+            print(f"{'ACTION':<13} | {'PAIRE':<10} | {'COURS':<10} | {'UNITÉS':<10} | {'VALEUR ($)':<12} | {'POIDS'}")
+            print("-" * 90)
             
             tickers = alloc_conviction.index.tolist()
-           # ... (juste après tickers = alloc_conviction...)
             shares = best_plan["shares"]
             
             for i, t in enumerate(tickers):
                 n = int(shares[i])
+                if n == 0: continue
+                
                 p = current_prices[t]
-                amt = n * p
-                w_real = abs(amt) / best_plan['cost'] # Poids en valeur absolue
+                amt = n * p # Valeur nominale en devise de cotation (souvent USD)
+                w_real = abs(amt) / best_plan['cost']
                 
-                # Action : ACHAT ou VENTE (Short)
-                action = "ACHAT (Long)" if n > 0 else "VENTE (Short)"
+                action = "🟢 ACHAT" if n > 0 else "🔴 VENTE"
                 
-                print(f"{action:<13} | {t.replace('=X',''):<10} | {p:<10.4f}   | {n:<10} | {amt:<10.2f} € | {w_real*100:.1f}%")
+                # Note: On affiche € ou $ selon ton budget, mais ici on met $ pour la logique
+                print(f"{action:<13} | {t.replace('=X',''):<10} | {p:<10.4f} | {n:<10} | {amt:<12.2f} $ | {w_real*100:.1f}%")
+            print("-" * 90)
         else:
-            print("Budget trop serré.")
+            print("Budget trop serré pour respecter les contraintes.")
 else:
-    print("Erreur données ou Optimisation échouée (Pas assez de variance).")
-
+    print("Pas de tendance claire détectée (Cash).")
+scenarios_list = [
+    {"id": 1, "years": (2010, 2020), "desc": f"FOREX | Window={WINDOW_YEARS}y | Filtre={SEUIL_FILTRE*100:.0f}%"}
+]
+for s in scenarios_list:
+    run_scenario(s["id"], s["desc"], s["years"][0], s["years"][1])
 plt.show()
