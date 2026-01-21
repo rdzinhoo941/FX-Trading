@@ -2,34 +2,34 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+import cvxpy as cp  # <--- LE NOUVEAU MOTEUR
 import pandas_datareader.data as web
 import warnings
 import time
+import sys
 
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 1. PARAMÈTRES DE LA GRID SEARCH
+# 1. PARAMÈTRES DE LA GRID SEARCH ÉTENDUE
 # ==============================================================================
 TARGET_BUDGET = 1000000.0   
-RISK_AVERSION = 2.5     
+RISK_AVERSION = 2.5      
 
 # PLAGE DE LEVIERS : De 1x à 15x
-LEVERAGES = list(range(1, 16)) # [1, 2, ..., 15]
+LEVERAGES = list(range(1, 16)) 
 
-# PLAGE DE FENÊTRES D'ENTRAÎNEMENT (En jours ouvrés approx)
-# 1m=21, 2m=42, 3m=63, 4m=84, 6m=126, 9m=189, 1y=252, 1.5y=378, 2y=504
+# PLAGE DE FENÊTRES D'ENTRAÎNEMENT (LOOKBACK PERIOD)
+# C'est ici que l'on définit combien de passé on regarde pour calculer Mu et Sigma
+# J'ai ajouté jusqu'à 3 ans comme demandé.
 WINDOWS = {
-    '1 Mois': 21,
     '2 Mois': 42,
     '3 Mois': 63,
-    '4 Mois': 84,
     '6 Mois': 126,
-    '9 Mois': 189,
     '1 An': 252,
     '1.5 Ans': 378,
-    '2 Ans': 504
+    '2 Ans': 504,
+    '3 Ans': 756  # <--- Ajout demandé
 }
 
 YEARS_TO_TEST = [2020, 2021, 2022, 2023, 2024]
@@ -40,17 +40,16 @@ pairs_list = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUS
     "USDSEK", "USDNOK", "USDMXN", "USDZAR", "USDBRL", "USDTRY", "USDINR", "USDSGD" 
 ]
 tickers = [f"{pair}=X" for pair in pairs_list]
-benchmark_ticker = "DX-Y.NYB"
 
-# On charge large pour avoir assez d'historique pour la fenêtre de 2 ans
-start_date = "2017-01-01" 
+# On charge plus large (2016) pour que la fenêtre de 3 ans ait assez de données pour commencer en 2020
+start_date = "2016-01-01" 
 end_date = "2025-01-01"
 
 print("█"*80)
-print(f"🚀 DÉMARRAGE GRID SEARCH MASSIVE")
+print(f"🚀 DÉMARRAGE GRID SEARCH MASSIVE (MOTEUR CVXPY)")
 print(f"🎯 Leviers: 1x à 15x")
-print(f"⏳ Fenêtres: {list(WINDOWS.keys())}")
-print(f"📅 Années: {YEARS_TO_TEST}")
+print(f"⏳ Fenêtres (Lookback): {list(WINDOWS.keys())}")
+print(f"📅 Années testées: {YEARS_TO_TEST}")
 print("█"*80)
 
 # ==============================================================================
@@ -60,7 +59,7 @@ print("\n📥 1. Téléchargement des Données (Prix)...")
 raw_data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
 data = raw_data.dropna(axis=1, how='all').ffill().dropna()
 valid_tickers = list(data.columns)
-print(f"   ✅ {len(valid_tickers)} paires valides.")
+print(f"   ✅ {len(valid_tickers)} paires valides récupérées.")
 
 print("📥 2. Construction Taux d'Intérêt (Hybride)...")
 fred_codes = {
@@ -69,11 +68,15 @@ fred_codes = {
     'CAD': 'IR3TIB01CAM156N', 'NZD': 'IR3TIB01NZM156N'
 }
 rates_daily = pd.DataFrame(0.0, index=data.index, columns=fred_codes.keys())
+
+# Bloc Try/Except pour FRED
 try:
     df_fred = web.DataReader(list(fred_codes.values()), 'fred', start_date, end_date)
     df_fred.columns = list(fred_codes.keys())
+    # Forward fill pour convertir mensuel en quotidien
     rates_daily.update((df_fred / 100.0).resample('D').ffill())
-except:
+except Exception as e:
+    print(f"⚠️ Erreur FRED: {e}. Utilisation taux fixes USD par défaut.")
     rates_daily['USD'] = 0.05 
 
 exotic_rates = {
@@ -91,49 +94,77 @@ for t in valid_tickers:
     clean_t = t.replace('=X', '')
     base, quote = clean_t[:3], clean_t[3:]
     r_price = price_returns[t]
+    
+    # Calcul du Carry
     r_carry = 0.0
     if base in rates_daily.columns and quote in rates_daily.columns:
-        r_carry = (rates_daily[base] - rates_daily[quote]) / 252
+        # On aligne les dates des taux sur les dates des prix
+        r_base = rates_daily[base].reindex(data.index).ffill()
+        r_quote = rates_daily[quote].reindex(data.index).ffill()
+        r_carry = (r_base - r_quote) / 252
+        
     returns_total[t] = r_price + r_carry
 
 returns_total.dropna(inplace=True)
 
 # ==============================================================================
-# 3. MOTEUR D'OPTIMISATION
+# 3. MOTEUR D'OPTIMISATION (VERSION CVXPY - RAPIDE)
 # ==============================================================================
-def get_optimal_weights(mu, sigma, risk_aversion, max_leverage):
+def get_optimal_weights_cvxpy(mu, sigma, risk_aversion, max_leverage):
+    """
+    Résout le problème Markowitz avec contraintes de levier via CVXPY.
+    Beaucoup plus rapide et robuste que scipy.optimize.
+    """
     n = len(mu)
-    init_guess = np.repeat(1/n, n)
     
-    def objective(w):
-        utility = (np.dot(w, mu) * 252) - (risk_aversion / 2) * (np.dot(w.T, np.dot(sigma, w)) * 252)
-        return -utility # On veut maximiser l'utilité
-
-    # Ici, petite astuce pour accélérer : On utilise une formule analytique simplifiée si possible
-    # Mais avec les contraintes de levier, on doit utiliser minimize.
-    # On va réduire la précision (tol) pour gagner du temps, car on fait du "grossier"
+    # Variables de décision (Poids)
+    w = cp.Variable(n)
     
-    def objective_func(w):
-        return -((np.dot(w, mu) * 252) - (risk_aversion / 2) * (np.dot(w.T, np.dot(sigma, w)) * 252))
-
-    cons = [
-        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}, # Investissement net = 100%
-        {'type': 'ineq', 'fun': lambda x: max_leverage - np.sum(np.abs(x))} # Levier Max
+    # Conversion inputs en numpy pour CVXPY
+    mu_np = mu.values
+    sigma_np = sigma.values
+    
+    # Stabilisation de la matrice (Covariance doit être PSD)
+    # On ajoute un epsilon minuscule sur la diagonale pour éviter les erreurs numériques
+    sigma_np += np.eye(n) * 1e-8
+    
+    # Fonction Objectif: Maximiser (Rendement - Penalité Risque)
+    # Note: mu est daily, sigma est daily. On annualise dans la formule.
+    ret = w @ mu_np
+    risk = cp.quad_form(w, sigma_np)
+    
+    # Maximiser Utilité
+    objective = cp.Maximize((ret * 252) - (risk_aversion / 2) * (risk * 252))
+    
+    # Contraintes
+    constraints = [
+        cp.sum(w) == 1.0,               # Investissement Net = 100%
+        cp.norm(w, 1) <= max_leverage,  # Levier Brut (Somme des val abs) <= Max
+        cp.abs(w) <= max_leverage * 0.6 # Pas plus de 60% du levier sur un seul actif
     ]
-    # Limite par actif pour éviter la concentration extrême (ex: +/- 60% du levier max)
-    limit = max_leverage * 0.6
-    bounds = tuple((-limit, limit) for _ in range(n))
+    
+    prob = cp.Problem(objective, constraints)
     
     try:
-        res = minimize(objective_func, init_guess, method='SLSQP', bounds=bounds, constraints=cons, tol=1e-4)
-        return res.x
-    except:
-        return init_guess
+        # OSQP est un solveur très robuste pour les problèmes quadratiques
+        prob.solve(solver=cp.OSQP, verbose=False)
+        
+        if w.value is None:
+            # Fallback si échec (rare)
+            return np.ones(n) / n
+        
+        # Petit nettoyage pour mettre les 0.0000001 à 0
+        weights = w.value
+        weights[np.abs(weights) < 1e-5] = 0
+        return weights
+        
+    except Exception:
+        return np.ones(n) / n
 
 # ==============================================================================
 # 4. GRID SEARCH EXECUTION
 # ==============================================================================
-results_log = [] # Pour stocker (Année, Fenêtre, Levier, Perf, Sharpe)
+results_log = [] 
 
 print("\n🏁 Lancement de la Simulation...")
 start_time_total = time.time()
@@ -146,64 +177,54 @@ for year in YEARS_TO_TEST:
     year_start = f"{year}-01-01"
     year_end = f"{year}-12-31"
     
-    # On récupère les dates de trading de l'année (Daily)
     trading_days = returns_total.loc[year_start:year_end].index
     
     if len(trading_days) < 10:
         print(f"⚠️ Pas assez de données pour {year}")
         continue
 
-    # --- BOUCLE FENÊTRES (TIME WINDOWS) ---
+    # --- BOUCLE FENÊTRES DE DONNÉES (LOOKBACK) ---
     for win_name, win_days in WINDOWS.items():
-        print(f"   🔎 Fenêtre: {win_name} ({win_days}j)...")
+        print(f"   🔎 Grid Lookback: {win_name} ({win_days} jours d'historique)")
         
-        # Initialisation des capitaux pour chaque levier
+        # Init capitaux
         capitals = {lev: TARGET_BUDGET for lev in LEVERAGES}
         
         # --- BOUCLE JOUR PAR JOUR (DAILY REBALANCING) ---
-        # C'est ici que ça se joue. On ne rebalance PAS tous les jours pour gagner du temps ? 
-        # NON, tu as demandé du Daily. On fait du Daily.
+        n_days = len(trading_days)
         
-        # --- BOUCLE JOUR PAR JOUR (CORRIGÉE) ---
-        for i in range(len(trading_days) - 1):
+        for i in range(n_days - 1):
             curr_date = trading_days[i]
             next_date = trading_days[i+1]
             
-            # 1. Calcul des données historiques
-            # CORRECTION : On prend les données jusqu'à curr_date, 
-            # MAIS on exclut la dernière ligne (.iloc[:-1]) car c'est la journée qu'on va trader !
-            # On veut décider le matin en ne connaissant que la veille.
+            # LOGGING DYNAMIQUE (Pour voir ce qui se passe)
+            if i % 20 == 0: # Affiche tous les 20 jours
+                sys.stdout.write(f"\r      ⏳ Progression {year} | {win_name}: Jour {i}/{n_days} traité...")
+                sys.stdout.flush()
             
-            full_history = returns_total.loc[:curr_date].iloc[:-1] 
-            hist_data = full_history.tail(win_days)
+            # 1. Extraction des données (La fenêtre glissante)
+            hist_data = returns_total.loc[:curr_date].tail(win_days)
             
-            # Sécurité : Si pas assez d'historique (ex: début 2020)
-            if len(hist_data) < win_days: 
+            if len(hist_data) < win_days * 0.95: 
                 continue 
             
-            # Si la fenêtre est trop courte par rapport au nombre d'actifs (ex: 20 paires, fenêtre 1 mois)
-            # La matrice de covariance explose. On saute si c'est mathématiquement instable.
-            if len(hist_data) < len(tickers) + 2:
-                continue
-
             mu = hist_data.mean()
             sigma = hist_data.cov()
             
-            # Rendement du marché pour le jour suivant (Ce qu'on essaie de capturer)
-            day_returns = returns_total.loc[curr_date:next_date].sum()
-            
-            # 2. Boucle sur les Leviers
+            # Rendement réel du marché pour le lendemain
+            day_returns = returns_total.loc[next_date]            
+            # 2. Boucle sur les Leviers (Calcul des poids et mise à jour)
             for lev in LEVERAGES:
-                # Optimisation
-                w = get_optimal_weights(mu, sigma, RISK_AVERSION, max_leverage=lev)
+                # Utilisation de CVXPY ici
+                w = get_optimal_weights_cvxpy(mu, sigma, RISK_AVERSION, max_leverage=lev)
                 
                 # Performance
                 port_ret = np.dot(w, day_returns)
                 capitals[lev] *= (1 + port_ret)
         
-        # --- FIN DE L'ANNÉE POUR CETTE FENÊTRE ---
-        # On loggue les résultats
-        print(f"      [RÉSULTATS {win_name}]")
+        print(f"\n      ✅ Terminé pour {win_name}.")
+
+        # --- SAUVEGARDE DES RÉSULTATS POUR CETTE FENÊTRE ---
         best_lev = 0
         best_perf = -999.0
         
@@ -211,26 +232,24 @@ for year in YEARS_TO_TEST:
             final_cap = capitals[lev]
             perf = (final_cap / TARGET_BUDGET) - 1
             
-            # On sauvegarde pour le CSV
             results_log.append({
                 'Annee': year,
-                'Fenetre': win_name,
+                'Fenetre_Lookback': win_name,
                 'Jours_Entrainement': win_days,
                 'Levier': lev,
                 'Capital_Fin': final_cap,
                 'Performance': perf
             })
             
-            # Affichage console intelligent (pas tout, juste les bornes et le best)
             if perf > best_perf:
                 best_perf = perf
                 best_lev = lev
-                
-            # On affiche quelques étapes clés pour contrôler
-            if lev in [1, 5, 10, 15]: 
-                print(f"      - Levier {lev}x : {perf:>7.2%}")
-        
-        print(f"      🏆 MEILLEUR LEVIER : {best_lev}x ({best_perf:+.2%})")
+
+        # Petit résumé console
+        print(f"      🏆 Best: Levier {best_lev}x -> {best_perf:+.2%}")
+        worst_lev = min(capitals, key=capitals.get)
+        print(f"      💀 Worst: Levier {worst_lev}x -> {(capitals[worst_lev]/TARGET_BUDGET)-1:+.2%}")
+        print("-" * 40)
 
 # ==============================================================================
 # 5. ANALYSE ET EXPORT
@@ -240,48 +259,40 @@ print("✅ SIMULATION TERMINÉE.")
 print("█"*80)
 
 df_results = pd.DataFrame(results_log)
-# Sauvegarde
-csv_filename = "grid_search_forex_results.csv"
+csv_filename = "grid_search_forex_cvxpy.csv"
 df_results.to_csv(csv_filename, index=False)
 print(f"💾 Résultats détaillés sauvegardés dans : {csv_filename}")
 
-# --- AFFICHAGE DU TABLEAU RECAPITULATIF (Moyenne par Fenêtre) ---
-print("\n📊 MOYENNE DE PERFORMANCE PAR FENÊTRE (Toutes années confondues, Levier 3x vs 10x)")
-print(f"{'FENÊTRE':<15} | {'LEV 3x (Moy)':<15} | {'LEV 10x (Moy)':<15}")
-print("-" * 50)
+# --- TABLEAU RECAPITULATIF CROISÉ (Moyenne Performance par Fenêtre et par Levier) ---
+print("\n📊 TABLEAU DE SYNTHÈSE (Performance Moyenne Annuelle)")
+pivot_table = df_results.pivot_table(
+    index='Fenetre_Lookback', 
+    columns='Levier', 
+    values='Performance', 
+    aggfunc='mean'
+)
 
+# On affiche une sélection de leviers pour la lisibilité
+cols_to_show = [1, 3, 5, 10, 15]
+print(pivot_table[cols_to_show].applymap(lambda x: f"{x:.2%}"))
+
+# --- GRAPHIQUE FINAL ---
+plt.figure(figsize=(15, 8))
+
+# On va plotter la moyenne des performances (toutes années confondues) pour chaque fenêtre
+# pour voir quelle quantité de données historique est la meilleure.
 for win_name in WINDOWS.keys():
-    mask = df_results['Fenetre'] == win_name
-    
-    # Perf moyenne levier 3
-    avg_3 = df_results[mask & (df_results['Levier'] == 3)]['Performance'].mean()
-    # Perf moyenne levier 10
-    avg_10 = df_results[mask & (df_results['Levier'] == 10)]['Performance'].mean()
-    
-    print(f"{win_name:<15} | {avg_3:>14.2%} | {avg_10:>14.2%}")
+    subset = df_results[df_results['Fenetre_Lookback'] == win_name]
+    # Groupe par levier pour avoir la courbe
+    avg_perf_by_lev = subset.groupby('Levier')['Performance'].mean()
+    plt.plot(avg_perf_by_lev.index, avg_perf_by_lev.values, marker='o', label=f"Lookback: {win_name}")
 
-# --- GRAPHIQUE FINAL : LE PLAFOND DE PERFORMANCE ---
-# On prend l'année 2022 (la meilleure) et 2023 (la pire) pour voir la courbe Levier/Perf
-plt.figure(figsize=(14, 6))
-
-years_to_plot = [2022, 2023]
-markers = ['o', 's', '^', 'D']
-
-for i, year in enumerate(years_to_plot):
-    plt.subplot(1, 2, i+1)
-    subset = df_results[df_results['Annee'] == year]
-    
-    # On trace une ligne par fenêtre
-    for win_name in ['1 Mois', '6 Mois', '2 Ans']:
-        data_win = subset[subset['Fenetre'] == win_name]
-        plt.plot(data_win['Levier'], data_win['Performance'], marker='o', label=win_name)
-    
-    plt.title(f"Impact du Levier - Année {year}")
-    plt.xlabel("Levier Max")
-    plt.ylabel("Performance Annuelle")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.axhline(0, color='black', linewidth=1)
+plt.title("Impact de l'Historique de Données (Lookback) sur la Performance Moyenne (2020-2024)")
+plt.xlabel("Levier Max")
+plt.ylabel("Performance Moyenne Annuelle")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.axhline(0, color='black', linewidth=1)
 
 plt.tight_layout()
 plt.show()
