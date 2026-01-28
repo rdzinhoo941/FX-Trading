@@ -2,311 +2,375 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
-import pandas_datareader.data as web
-import xgboost as xgb
+import seaborn as sns
+from scipy.stats import norm, skew, kurtosis
+import os
 import warnings
 
+# ==============================================================================
+# 1. CONFIGURATION GLOBALE
+# ==============================================================================
 warnings.filterwarnings("ignore")
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
+sns.set_theme(style="whitegrid")
 
-# ==============================================================================
-# 1. PARAMÈTRES & UNIVERS ÉLARGI
-# ==============================================================================
+# --- Paramètres Stratégie ---
 TARGET_BUDGET = 1000000.0   
-RISK_AVERSION = 2.5     
+LEVERAGE_PER_POS = 0.20     # Levier réduit à 20% par pos (pour réduire le DD)
+TRANSACTION_COST = 0.0005   
+LOOKBACK_MOMENTUM = 252     
+FILE_RETURNS = "MASTER_RETURNS.csv" # Le fichier pont entre Stratégie et Risque
 
-# TA LISTE COMPLÈTE (Majeurs + Cross + Exotiques)
+# --- Paramètres Risk Management ---
+CONFIDENCE_LEVEL = 0.95  
+RISK_FREE_RATE = 0.0     
+TRADING_DAYS = 252       
+MC_SIMULATIONS = 10000   
+
 pairs_list = [
-    "EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", # Majeurs
-    "EURJPY", "EURGBP", "EURCHF", "AUDJPY", "NZDJPY", # Cross
-    "USDSEK", "USDNOK", "USDMXN", "USDZAR", "USDBRL", "USDTRY", "USDINR", "USDSGD" # Exotiques / Yield
+    "EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD",
+    "EURJPY", "EURGBP", "AUDJPY", "NZDJPY",
+    "USDMXN", "USDTRY", "USDZAR", "USDSGD", "USDNOK", "USDSEK"
 ]
-
 tickers = [f"{pair}=X" for pair in pairs_list]
-benchmark_ticker = "DX-Y.NYB"
-start_date = "2010-01-01"
-end_date = "2025-01-01"
+start_date = "2018-01-01" 
+end_date = "2025-12-31"
 
-print("█"*80)
-print(f"🚀 DÉMARRAGE 'GLOBAL MACRO UNIVERSE' ({len(pairs_list)} Paires) | Budget: {TARGET_BUDGET:,.0f} $")
-print("█"*80)
+print(f" PARTIE 1 : BACKTEST 'GLOBAL MACRO MOMENTUM' (WEEKLY)")
 
 # ==============================================================================
-# 2. TÉLÉCHARGEMENT DONNÉES PRIX
+# 2. DATA & TAUX
 # ==============================================================================
-print("\n📥 1. Téléchargement des Prix (Yahoo Finance)...")
-data = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close'].ffill().dropna()
+print("\n📥 1. Téléchargement Données & Simulation Taux...")
+# Threading False pour éviter les timeouts
+data = yf.download(tickers, start=start_date, end=end_date, progress=False, threads=False)['Close'].ffill().dropna()
 
-print("📥 2. Téléchargement du Benchmark (Dollar Index)...")
-bench_data = yf.download(benchmark_ticker, start=start_date, end=end_date, progress=False)['Close'].ffill().dropna()
-
-# ==============================================================================
-# 3. TÉLÉCHARGEMENT TAUX D'INTÉRÊT (FRED - MAJEURS & EXOTIQUES)
-# ==============================================================================
-print("📥 3. Téléchargement des Taux d'Intérêt (FRED - Central Bank & Interbank Rates)...")
-
-# Dictionnaire complet pour couvrir ton univers
-fred_codes = {
-    # Majeurs (Interbank 3M)
-    'USD': 'IR3TIB01USM156N', 'EUR': 'IR3TIB01EZM156N', 'JPY': 'IR3TIB01JPM156N',
-    'GBP': 'IR3TIB01GBM156N', 'CHF': 'IR3TIB01CHM156N', 'AUD': 'IR3TIB01AUM156N',
-    'CAD': 'IR3TIB01CAM156N', 'NZD': 'IR3TIB01NZM156N',
+fred_codes = {k: 'SIM' for k in ['USD','EUR','JPY','GBP','CHF','AUD','CAD','NZD','MXN','ZAR','BRL','TRY','SGD','SEK','NOK','INR']}
+def generate_macro_rates(price_index):
+    dates = price_index
+    rates = pd.DataFrame(index=dates, columns=fred_codes.keys())
+    rates[:] = 0.0 
     
-    # Exotiques & Scandies (Policy Rates / Short Term Rates)
-    'SEK': 'IR3TIB01SEM156N', # Suède
-    'NOK': 'IR3TIB01NOM156N', # Norvège
-    'MXN': 'INTDSRMXM193N',   # Mexique (Taux Directeur)
-    'ZAR': 'INTDSRZAM193N',   # Afrique du Sud
-    'BRL': 'INTDSRBRM193N',   # Brésil
-    'TRY': 'INTDSRTRM193N',   # Turquie (Crucial pour le Carry !)
-    'INR': 'INTDSRINM193N',   # Inde
-    'SGD': 'INTDSRSGM193N'    # Singapour
-}
+    rates['USD'] = 0.015; rates['EUR'] = 0.0; rates['JPY'] = -0.001
+    rates['GBP'] = 0.0075; rates['CHF'] = -0.0075; rates['AUD'] = 0.015
+    rates['MXN'] = 0.07; rates['TRY'] = 0.12; rates['ZAR'] = 0.06
+    
+    mask = dates >= '2022-03-01'
+    def hike(c, t, v=0.0):
+        if np.sum(mask) > 0:
+            start = rates.loc[~mask, c].iloc[-1] if not rates.loc[~mask, c].empty else 0
+            path = np.linspace(start, t, np.sum(mask))
+            noise = np.random.normal(0, v/2, np.sum(mask)) 
+            rates.loc[mask, c] = path + noise
 
-try:
-    # Téléchargement
-    rates_df = web.DataReader(list(fred_codes.values()), 'fred', start_date, end_date)
-    # Mapping des colonnes (Code FRED -> Symbole Devise)
-    inv_map = {v: k for k, v in fred_codes.items()}
-    rates_df.rename(columns=inv_map, inplace=True)
-    
-    # Conversion % -> Décimal et remplissage des trous (fréquence mensuelle -> journalière)
-    rates_daily = (rates_df / 100.0).resample('D').ffill().reindex(data.index).ffill()
-    
-    # Gestion des devises manquantes (si FRED échoue sur certaines)
-    for curr in fred_codes.keys():
-        if curr not in rates_daily.columns:
-            rates_daily[curr] = 0.0
-            
-    print("   ✅ Taux FRED récupérés (Majeurs + Exotiques).")
-    
-except Exception as e:
-    print(f"   ⚠️ Erreur partielle FRED: {e}. Carry Trade limité.")
-    rates_daily = pd.DataFrame(0.0, index=data.index, columns=fred_codes.keys())
+    hike('USD', 0.055); hike('EUR', 0.040); hike('GBP', 0.052)
+    hike('JPY', -0.001); hike('MXN', 0.1125); hike('TRY', 0.45, 0.02)
+    return rates
+
+rates_daily = generate_macro_rates(data.index).resample('D').ffill().reindex(data.index).ffill() / 252.0
 
 # ==============================================================================
-# 4. CALCUL RENDEMENTS NETS (PRIX + CARRY)
+# 3. CALCUL MOMENTUM & RENDEMENTS
 # ==============================================================================
-print("⚙️ Calcul des rendements Totaux (Prix + Différentiel Taux)...")
+print(" 2. Calcul des Rendements Totaux & Scores...")
+
 returns_total = pd.DataFrame(index=data.index, columns=data.columns)
-price_returns = data.pct_change()
+momentum_score = pd.DataFrame(index=data.index, columns=data.columns)
 
 for t in tickers:
-    # Nettoyage du ticker (USDTRY=X -> Base:USD, Quote:TRY)
-    clean_t = t.replace('=X', '')
+    clean = t.replace('=X','')
+    base, quote = clean[:3], clean[3:]
     
-    # Logique spéciale pour identifier Base et Quote
-    # Yahoo met souvent la devise forte en premier, mais pas toujours.
-    # On assume le standard ISO : EURUSD, USDJPY, USDTRY...
-    base = clean_t[:3]
-    quote = clean_t[3:]
-    
-    r_price = price_returns[t]
+    r_price = data[t].pct_change()
     r_carry = 0.0
-    
     if base in rates_daily.columns and quote in rates_daily.columns:
-        # Différentiel annuel ramené au jour (252 jours ouvrés)
-        r_carry = (rates_daily[base] - rates_daily[quote]) / 252
+        r_carry = rates_daily[base] - rates_daily[quote]
     
-    returns_total[t] = r_price + r_carry
+    total_daily_ret = r_price + r_carry
+    returns_total[t] = total_daily_ret
+    
+    # Momentum 12 Mois
+    log_rets = np.log(1 + total_daily_ret)
+    momentum_score[t] = log_rets.rolling(LOOKBACK_MOMENTUM).sum().shift(1)
 
 returns_total.dropna(inplace=True)
+momentum_score.dropna(inplace=True)
 
 # ==============================================================================
-# 5. FEATURE ENGINEERING (ML)
+# 4. BACKTEST ENGINE
 # ==============================================================================
-print("🧠 Génération des Features (RSI, Vol, Trend)...")
-
-def create_features(prices, rets):
-    feats = {}
-    for t in prices.columns:
-        df = pd.DataFrame(index=prices.index)
-        p = prices[t]
-        r = rets[t]
-        
-        # Momentum
-        df['Ret_5d'] = p.pct_change(5).shift(1)
-        df['Ret_21d'] = p.pct_change(21).shift(1)
-        
-        # Volatilité
-        df['Vol_21d'] = r.rolling(21).std().shift(1)
-        
-        # RSI
-        delta = p.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        df['RSI'] = (100 - (100 / (1 + gain/loss))).shift(1)
-        
-        # Distance Moyenne Mobile (Mean Reversion)
-        sma50 = p.rolling(50).mean().shift(1)
-        df['Dist_SMA50'] = (p.shift(1) / sma50) - 1
-        
-        feats[t] = df.dropna()
-    return feats
-
-features_all = create_features(data, returns_total)
-
-# ==============================================================================
-# 6. FONCTIONS (XGBOOST, HURST, MARKOWITZ)
-# ==============================================================================
-
-def calculate_hurst_complex(ts, max_lag=20):
-    ts = ts.dropna().values
-    if len(ts) < 50: return 0.5
-    lags = range(2, min(max_lag, len(ts)//2))
-    tau = []
-    for lag in lags:
-        # Simple R/S proxy via Standard Deviation of differences
-        pp = np.subtract(ts[lag:], ts[:-lag])
-        tau.append(np.std(pp))
-    if len(tau) < 2: return 0.5
-    try:
-        m = np.polyfit(np.log(lags), np.log(tau), 1)
-        return m[0] * 2.0 # Approximation Hurst
-    except:
-        return 0.5
-
-def predict_returns_xgb(curr_date):
-    preds = []
-    train_start = curr_date - pd.DateOffset(years=2)
+def allocation_system(curr_date):
+    if curr_date not in momentum_score.index: return np.zeros(len(tickers))
     
-    for t in tickers:
-        if t not in features_all: 
-            preds.append(0.0)
-            continue
+    scores = momentum_score.loc[curr_date]
+    ranked = scores.sort_values(ascending=False)
+    weights = np.zeros(len(tickers))
+    
+    # Top 3 Longs / Top 3 Shorts
+    top_3 = ranked.head(3).index
+    bottom_3 = ranked.tail(3).index
+    
+    for t in top_3:
+        weights[tickers.index(t)] = LEVERAGE_PER_POS 
+        
+    for t in bottom_3:
+        idx = tickers.index(t)
+        if scores[t] < 0: weights[idx] = -LEVERAGE_PER_POS
+        else: weights[idx] = 0.0
             
-        df = features_all[t]
-        mask = (df.index >= train_start) & (df.index < curr_date)
-        X_train = df.loc[mask]
-        y_train = returns_total[t].reindex(X_train.index)
-        
-        if len(X_train) < 50 or curr_date not in df.index:
-            preds.append(0.0)
-            continue
-            
-        model = xgb.XGBRegressor(n_estimators=40, max_depth=3, learning_rate=0.05, n_jobs=1, random_state=42)
-        model.fit(X_train, y_train)
-        pred = model.predict(df.loc[[curr_date]])[0]
-        preds.append(pred)
-    return np.array(preds)
+    return weights
 
-def optimize_markowitz_sport(mu, sigma, risk_aversion, max_lev=1.0):
-    n = len(mu)
-    def objective(w):
-        ret = np.dot(w, mu) * 52
-        vol = np.sqrt(np.dot(w.T, np.dot(sigma, w))) * np.sqrt(52)
-        penalty = 0.05 * np.sum(w**2) 
-        return -(ret - (risk_aversion/2)*vol**2 - penalty)
-    
-    cons_net = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}
-    # Levier Global Max : 3.0x (Mode Sport)
-    GLOBAL_MAX = 3.0
-    actual_limit = min(GLOBAL_MAX, max_lev)
-    cons_lev = {'type': 'ineq', 'fun': lambda x: actual_limit - np.sum(np.abs(x))}
-    
-    constraints = [cons_net, cons_lev]
-    # Diversification forcée (Max 40% par actif) pour éviter le suicide sur USDTRY
-    bounds = tuple((-0.4, 0.4) for _ in range(n))
-    
-    try:
-        init_guess = np.repeat(1/n, n)
-        res = minimize(objective, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
-        return res.x
-    except:
-        return np.repeat(1/n, n)
+print("\n 3. Exécution Backtest (2020-2025)...")
 
-# ==============================================================================
-# 7. BACKTEST (2023-2025)
-# ==============================================================================
-print("\n🤖 Lancement Backtest sur UNIVERS ÉLARGI (Mode Sport : Levier 3x)...")
+rebal_dates = returns_total.loc["2020-01-01":].resample('W-FRI').last().index
+curr_weights = np.zeros(len(tickers))
+strategy_returns = [] # Pour stocker les rendements de la strat jour par jour
 
-test_start_date = "2023-01-01"
-rebal_dates = returns_total.loc[test_start_date:].resample('W-FRI').last().index
+# On parcourt jour par jour pour avoir une série temporelle propre pour le Risk Management
+daily_dates = returns_total.loc["2020-01-01":].index
+current_weights_daily = np.zeros(len(tickers))
+
+# Dictionnaire pour savoir quand rebalancer
+rebal_set = set(rebal_dates)
 
 capital = TARGET_BUDGET
-history_values = []
-history_dates = []
 
-for i in range(len(rebal_dates) - 1):
-    curr_date = rebal_dates[i]
-    next_date = rebal_dates[i+1]
-    
-    # 1. IA Prediction
-    mu_pred = predict_returns_xgb(curr_date)
-    
-    # 2. Hurst (Régime sur PRIX pur)
-    hursts = []
-    for t in tickers:
-        series = np.log(data.loc[:curr_date, t].tail(100))
-        hursts.append(calculate_hurst_complex(series))
-    avg_hurst = np.nanmean(hursts)
-    
-    # 3. Réglage Levier Dynamique
-    lev_target = 2.0
-    regime = "NEUTRAL"
-    if avg_hurst > 0.6: 
-        lev_target = 3.0
-        regime = "TRENDING"
-    elif avg_hurst < 0.45:
-        lev_target = 1.0
-        regime = "MEAN-REV"
+for d in daily_dates:
+    # 1. Rebalancement si on est un vendredi
+    if d in rebal_set:
+        target_weights = allocation_system(d)
+        # Coûts
+        turnover = np.sum(np.abs(target_weights - current_weights_daily))
+        cost = turnover * TRANSACTION_COST
+        # On applique le coût au rendement du jour (simplification)
+        current_weights_daily = target_weights
+    else:
+        cost = 0.0
         
-    # 4. Optimisation
-    sigma = returns_total.loc[:curr_date].tail(120).cov()
-    w = optimize_markowitz_sport(mu_pred, sigma, RISK_AVERSION, max_lev=lev_target)
+    # 2. Calcul PnL du jour
+    # Rendement du jour * Poids de la veille
+    day_ret_vector = returns_total.loc[d]
+    port_ret = np.dot(current_weights_daily, day_ret_vector) - cost
     
-    # 5. Simulation
-    week_ret = returns_total.loc[curr_date:next_date].dot(w).sum()
-    capital *= (1 + week_ret)
-    
-    history_values.append(capital)
-    history_dates.append(next_date)
-    
-    # 6. Logs (Mensuel)
-    if i % 4 == 0:
-        tot_lev = np.sum(np.abs(w))
-        print(f"\n📅 {curr_date.date()} | Cap: {capital:,.0f} $ | Hurst: {avg_hurst:.2f} ({regime})")
-        print(f"   🔥 Levier: {tot_lev:.2f}x (Max: {lev_target}x)")
-        
-        # Affichage Top Convictions
-        sorted_idx = np.argsort(w)
-        tops = []
-        for idx in np.concatenate([sorted_idx[:2], sorted_idx[-2:][::-1]]):
-            if abs(w[idx]) > 0.05:
-                # Affichage du Carry Annuel Estimé pour la paire
-                t = tickers[idx]
-                pair_base, pair_quote = t.replace('=X','')[:3], t.replace('=X','')[3:]
-                carry = 0.0
-                if pair_base in rates_daily.columns:
-                    carry = rates_daily.loc[curr_date, pair_base] - rates_daily.loc[curr_date, pair_quote]
-                
-                # Sens du trade
-                side = "🟢" if w[idx] > 0 else "🔴" # Long ou Short
-                # Si on short, le carry est inversé
-                net_carry = carry if w[idx] > 0 else -carry
-                
-                tops.append(f"{side}{t[:-2]}:{w[idx]:.0%} (Carry:{net_carry:.1%})")
-                
-        print(f"   ⚖️ {', '.join(tops)}")
+    strategy_returns.append(port_ret)
+    capital *= (1 + port_ret)
+
+# Création du fichier MASTER_RETURNS.csv
+# On combine les rendements des Paires + La Stratégie
+df_export = returns_total.loc[daily_dates].copy()
+df_export['STRATEGY'] = strategy_returns # On ajoute notre algo comme un actif
+df_export.to_csv(FILE_RETURNS)
+
+print(f" Backtest terminé. Capital Final: {capital:,.0f} $")
+print(f" Données sauvegardées dans '{FILE_RETURNS}' pour l'analyse de risque.")
+
 
 # ==============================================================================
-# 8. RÉSULTATS FINAUX
 # ==============================================================================
-df_res = pd.DataFrame({'Global Macro AI': history_values}, index=history_dates)
-bench_rebased = bench_data.reindex(history_dates).ffill()
-bench_rebased = bench_rebased / bench_rebased.iloc[0] * TARGET_BUDGET
-df_res['Dollar Index'] = bench_rebased
+# PARTIE 2 : MODULE DE RISK MANAGEMENT (Ton Code Intégré)
+# ==============================================================================
+# ==============================================================================
 
-print("\n" + "="*80)
-print(f"RÉSULTAT FINAL : {capital:,.2f} $")
-print(f"PERFORMANCE    : {(capital/TARGET_BUDGET - 1):.2%}")
-print("="*80)
+def run_full_analysis():
+    print(" PARTIE 2 : ANALYSE DE RISQUE (QUANTITATIVE)")
+    
+    # 1. CHARGEMENT
+    if not os.path.exists(FILE_RETURNS):
+        print(f"Erreur : {FILE_RETURNS} introuvable.")
+        return
+    
+    df_ret = pd.read_csv(FILE_RETURNS, index_col=0, parse_dates=True)
+    # Nettoyage des données infinies ou NaN
+    df_ret = df_ret.replace([np.inf, -np.inf], np.nan).dropna()
+    
+    print(f" Analyse sur {df_ret.shape[1]} actifs (incluant 'STRATEGY') sur {df_ret.shape[0]} jours.")
 
-plt.figure(figsize=(12, 6))
-plt.plot(df_res['Global Macro AI'], label='AI Markowitz (20 Paires)', color='blue', linewidth=1.5)
-plt.plot(df_res['Dollar Index'], label='Dollar Index', color='orange', linestyle='--', alpha=0.7)
-plt.title(f"Performance Global Macro AI (Majeurs + Exotiques)")
-plt.ylabel("Valeur Portefeuille ($)")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
+    # ---------------------------------------------------------
+    # BLOC 1 : VOLATILITÉ
+    # ---------------------------------------------------------
+    print("\n--- BLOC 1 : ANALYSE DE LA VOLATILITÉ ---")
+    vol_ann = df_ret.std() * np.sqrt(TRADING_DAYS)
+    
+    downside_returns = df_ret[df_ret < 0]
+    semi_dev = downside_returns.std() * np.sqrt(TRADING_DAYS)
+    
+    # EWMA (Volatilité pondérée)
+    ewma_vol = df_ret.ewm(alpha=0.06).std().iloc[-1] * np.sqrt(TRADING_DAYS)
+
+    df_block1 = pd.DataFrame({
+        'Volatilité (Ann)': vol_ann,
+        'Semi-Déviation': semi_dev,
+        'EWMA (Actuelle)': ewma_vol,
+        'Ratio Symétrie': vol_ann / semi_dev
+    })
+
+    # ---------------------------------------------------------
+    # BLOC 2 : TAIL RISK (VaR & CVaR)
+    # ---------------------------------------------------------
+    print("--- BLOC 2 : ANALYSE DES QUEUES (VaR & CVaR) ---")
+    
+    # VaR Historique
+    var_hist = df_ret.quantile(1 - CONFIDENCE_LEVEL)
+    
+    # VaR Paramétrique
+    mu = df_ret.mean()
+    sigma = df_ret.std()
+    z_score = norm.ppf(1 - CONFIDENCE_LEVEL)
+    var_param = mu + z_score * sigma
+    
+    # VaR Monte Carlo
+    var_mc = []
+    # On réduit les simus si trop lent, mais 10000 c'est bien
+    for col in df_ret.columns:
+        simulated_rets = np.random.normal(mu[col], sigma[col], MC_SIMULATIONS)
+        var_mc.append(np.percentile(simulated_rets, (1 - CONFIDENCE_LEVEL) * 100))
+    var_mc_series = pd.Series(var_mc, index=df_ret.columns)
+
+    # CVaR
+    cvar_list = []
+    for col in df_ret.columns:
+        cutoff = var_hist[col]
+        tail_losses = df_ret[col][df_ret[col] <= cutoff]
+        cvar_list.append(tail_losses.mean() if not tail_losses.empty else 0)
+    cvar_series = pd.Series(cvar_list, index=df_ret.columns)
+
+    df_block2 = pd.DataFrame({
+        f'VaR Hist {CONFIDENCE_LEVEL:.0%}': var_hist,
+        f'VaR Param': var_param,
+        f'VaR MonteCarlo': var_mc_series,
+        f'CVaR': cvar_series
+    })
+
+    # ---------------------------------------------------------
+    # BLOC 3 : PERFORMANCE & CORRÉLATION
+    # ---------------------------------------------------------
+    print("--- BLOC 3 : PERFORMANCE & RATIOS ---")
+    
+    mean_ret_ann = df_ret.mean() * TRADING_DAYS
+    sharpe = (mean_ret_ann - RISK_FREE_RATE) / vol_ann
+    sortino = (mean_ret_ann - RISK_FREE_RATE) / semi_dev
+    
+    # Beta vs 'STRATEGY' (pour voir la contribution de chaque devise à la strat)
+    market_index = df_ret['STRATEGY']
+    market_var = market_index.var()
+    betas = []
+    for col in df_ret.columns:
+        cov = df_ret[col].cov(market_index)
+        beta = cov / market_var if market_var != 0 else 0
+        betas.append(beta)
+    beta_series = pd.Series(betas, index=df_ret.columns)
+
+    df_block3 = pd.DataFrame({
+        'Rendement (Ann)': mean_ret_ann,
+        'Ratio Sharpe': sharpe,
+        'Ratio Sortino': sortino,
+        'Beta (vs Strategy)': beta_series
+    })
+
+    # ---------------------------------------------------------
+    # BLOC 4 : DISTRIBUTION & DRAWDOWNS
+    # ---------------------------------------------------------
+    print("--- BLOC 4 : TRAJECTOIRES & DRAWDOWNS ---")
+    
+    skew_s = df_ret.apply(skew)
+    kurt_s = df_ret.apply(kurtosis)
+    
+    nav = (1 + df_ret).cumprod() * 100
+    running_max = nav.cummax()
+    drawdown = (nav - running_max) / running_max
+    max_drawdown = drawdown.min()
+    calmar = mean_ret_ann / abs(max_drawdown)
+    
+    df_block4 = pd.DataFrame({
+        'Skewness': skew_s,
+        'Kurtosis': kurt_s,
+        'Max Drawdown': max_drawdown,
+        'Ratio Calmar': calmar
+    })
+
+    # ---------------------------------------------------------
+    # SAUVEGARDE
+    # ---------------------------------------------------------
+    global_report = pd.concat([df_block1, df_block2, df_block3, df_block4], axis=1)
+    global_report = global_report.sort_values(by='Ratio Sharpe', ascending=False)
+    
+    global_report.to_csv("RAPPORT_GLOBAL_RISQUE.csv")
+    print(f"\n Rapport sauvegardé : RAPPORT_GLOBAL_RISQUE.csv")
+    
+    # Focus sur la Stratégie
+    print("\n--- PERFORMANCE DE LA STRATÉGIE ---")
+    print(global_report.loc[['STRATEGY']].T)
+
+def generate_visuals():
+    if not os.path.exists(FILE_RETURNS): return
+
+    returns = pd.read_csv(FILE_RETURNS, index_col=0, parse_dates=True)
+    print("\n Génération des graphiques...")
+
+    # 1. HEATMAP (Sans la Stratégie pour voir les devises entre elles)
+    plt.figure(figsize=(12, 10))
+    ret_assets = returns.drop(columns=['STRATEGY'], errors='ignore')
+    corr = ret_assets.corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    sns.heatmap(corr, mask=mask, cmap='coolwarm', center=0, square=True, linewidths=.5, cbar_kws={"shrink": .5}, annot=True, fmt=".1f", annot_kws={"size": 7})
+    plt.title('Corrélation Croisée des Devises', fontsize=16)
+    plt.tight_layout()
+    plt.savefig('CHART_1_CORRELATION.png', dpi=150)
+
+    # 2. RISK vs RETURN
+    summary = pd.DataFrame()
+    summary['Returns'] = returns.mean() * 252
+    summary['Volatility'] = returns.std() * np.sqrt(252)
+    
+    plt.figure(figsize=(12, 8))
+    # Toutes les devises en bleu
+    sns.scatterplot(data=summary.drop('STRATEGY', errors='ignore'), x='Volatility', y='Returns', s=100, color='gray', alpha=0.5, label='Paires FX')
+    # La Stratégie en ROUGE GROS
+    if 'STRATEGY' in summary.index:
+        strat = summary.loc['STRATEGY']
+        plt.scatter(strat['Volatility'], strat['Returns'], s=300, color='red', label='TA STRATÉGIE', edgecolors='black')
+        plt.text(strat['Volatility']+0.005, strat['Returns'], "STRATEGY", fontsize=12, fontweight='bold', color='red')
+
+    for i in range(len(summary)):
+        if summary.index[i] != 'STRATEGY':
+            plt.text(summary.Volatility[i], summary.Returns[i], summary.index[i], fontsize=8, alpha=0.7)
+
+    plt.axhline(0, color='black', linestyle='--')
+    plt.title('Efficient Frontier : Ta Stratégie vs Le Marché', fontsize=16)
+    plt.xlabel('Risque (Volatilité)', fontsize=12)
+    plt.ylabel('Rendement', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig('CHART_2_RISK_RETURN.png', dpi=150)
+
+    # 3. DISTRIBUTION STRATÉGIE (Histogramme)
+    plt.figure(figsize=(12, 6))
+    if 'STRATEGY' in returns.columns:
+        sns.histplot(returns['STRATEGY'], bins=50, kde=True, color='blue')
+        plt.axvline(returns['STRATEGY'].mean(), color='red', linestyle='--', label='Moyenne')
+        # VaR Line
+        var_95 = returns['STRATEGY'].quantile(0.05)
+        plt.axvline(var_95, color='orange', linestyle='--', label=f'VaR 95% ({var_95:.2%})')
+        plt.title('Distribution des Rendements Hebdomadaires de la Stratégie', fontsize=16)
+        plt.legend()
+    plt.savefig('CHART_3_DISTRIBUTION.png', dpi=150)
+
+    # 4. DRAWDOWNS
+    plt.figure(figsize=(12, 6))
+    cum_ret = (1 + returns['STRATEGY']).cumprod()
+    running_max = cum_ret.cummax()
+    drawdown = (cum_ret - running_max) / running_max
+    plt.plot(drawdown.index, drawdown, label='Drawdown Stratégie', color='red')
+    plt.fill_between(drawdown.index, drawdown, 0, color='red', alpha=0.3)
+    plt.title('Analyse du Drawdown (Profondeur des pertes)', fontsize=16)
+    plt.ylabel('Drawdown', fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.savefig('CHART_4_DRAWDOWN.png', dpi=150)
+    
+    print("-> 4 Graphiques générés.")
+
+if __name__ == "__main__":
+    run_full_analysis()
+    generate_visuals()
+    plt.show()
