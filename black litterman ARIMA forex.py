@@ -3,49 +3,50 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.optimize import minimize
-import xgboost as xgb
+from statsmodels.tsa.arima.model import ARIMA
 import os
 import warnings
 
 # ==============================================================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & SETUP
 # ==============================================================================
 warnings.filterwarnings("ignore")
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 sns.set_theme(style="whitegrid")
 
-# Directory
-OUTPUT_DIR = "backtest_results_xgboost"
+# Directory Management
+OUTPUT_DIR = "backtest_results_arima_bl"
 if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-FILE_RETURNS = os.path.join(OUTPUT_DIR, "MASTER_RETURNS_XGB.csv")
+FILE_RETURNS = os.path.join(OUTPUT_DIR, "MASTER_RETURNS_ARIMA.csv")
 
-# --- Strategy Params ---
+# --- Strategy Parameters ---
 TARGET_BUDGET = 1000000.0   
-TRANSACTION_COST = 0.0005    
-LOOKBACK_COV = 126           # Pour la matrice de risque BL
+TRANSACTION_COST = 0.0005    # 5 bps
+LOOKBACK_COV = 126           # 6 Mois pour la matrice de risque
+ARIMA_ORDER = (1, 0, 0)      # Modèle AR(1) simple pour la rapidité et éviter l'overfitting
+ARIMA_WINDOW = 60            # Fenêtre glissante pour l'entraînement (3 mois)
 
-# --- XGBoost Params ---
-# On réentraîne le modèle tous les 20 jours de trading (1 mois)
-RETRAIN_FREQ = 20            
-TRAIN_WINDOW = 500           # On utilise les 2 dernières années pour entraîner (Rolling Window)
-
-# --- Black-Litterman Params ---
+# --- Black-Litterman Parameters ---
 RISK_AVERSION_DELTA = 2.5    
 TAU = 0.05                   
-MAX_WEIGHT = 0.30            
+MAX_WEIGHT = 0.4            # On autorise un peu plus de concentration
 GROSS_LEVERAGE = 1.5         # Levier 1.5x
+# note : ici, limiter à 0.4 et 1.5 le total revient en théorie à limiter à 1.2 les poids si on limite le levier total à 4.5, 
+# pour autant, on n'a pas forcément 3* plus ou 3* moins de bénéfice à la fin, ce qui rend l'équation assez complexe.  
+# ici, on fait par exemple, pour 0.4 et 1.5, +5.6 %, contre -4% pour 1.2 et 4.5
+SIGNAL_AMPLIFIER = 100.0     # ARIMA sort des petits chiffres (ex: 0.0001), on booste pour la Vue
 
-# --- Risk Params ---
+# --- Risk Analysis Parameters ---
 CONFIDENCE_LEVEL = 0.95  
 TRADING_DAYS = 252        
 
 print("="*80)
-print(f" 🚀 STARTING: XGBOOST AI BLACK-LITTERMAN STRATEGY")
+print(f" 🚀 STARTING: BLACK-LITTERMAN FX STRATEGY POWERED BY ARIMA")
 print("="*80)
 
 # ==============================================================================
-# 2. DATA LOADING
+# 2. DATA LOADING (LOCAL CSV)
 # ==============================================================================
 print("\n[1] Loading Local Data...")
 try:
@@ -56,9 +57,9 @@ try:
     prices = prices.loc[common_idx]
     rates_daily = rates_daily.loc[common_idx]
     
-    # On commence large pour le Feature Engineering
-    prices = prices.loc["2015-01-01":]
-    rates_daily = rates_daily.loc["2015-01-01":]
+    # On commence plus tôt pour avoir assez d'historique pour le premier ARIMA
+    prices = prices.loc["2017-01-01":]
+    rates_daily = rates_daily.loc["2017-01-01":]
     
     tickers = prices.columns.tolist()
     print(f"   ✅ Data Loaded: {len(tickers)} pairs, {len(prices)} days.")
@@ -68,16 +69,20 @@ except FileNotFoundError:
     exit()
 
 # ==============================================================================
-# 3. FEATURE ENGINEERING & XGBOOST SIGNALS
+# 3. SIGNAL GENERATION (ARIMA ROLLING FORECAST)
 # ==============================================================================
-print("\n[2] Training XGBoost Models (Walk-Forward)...")
+print("[2] Generating ARIMA Signals (This may take a few minutes)...")
 
-# A. Préparation des Features
-# ---------------------------
 returns_total = pd.DataFrame(index=prices.index, columns=tickers)
+arima_signals = pd.DataFrame(index=prices.index, columns=tickers)
+
+def parse_pair(ticker):
+    clean = ticker.replace('=X', '')
+    return clean[:3], clean[3:]
+
+# 1. Calcul des Rendements Totaux (Prix + Carry)
 for t in tickers:
-    clean = t.replace('=X', '')
-    base, quote = clean[:3], clean[3:]
+    base, quote = parse_pair(t)
     r_price = prices[t].pct_change()
     r_carry = 0.0
     if base in rates_daily.columns and quote in rates_daily.columns:
@@ -86,95 +91,67 @@ for t in tickers:
 
 returns_total.dropna(inplace=True)
 
-# On va créer un gros DataFrame avec toutes les features
-# Pour simplifier, on entraîne un modèle PAR PAIRE
-xgboost_predictions = pd.DataFrame(index=returns_total.index, columns=tickers)
+# 2. ARIMA Rolling Loop
+# Pour gagner du temps, on ne recalcule pas ARIMA chaque jour, mais on utilise
+# une logique simplifiée ou on le fait uniquement sur les dates de rebalancement (Vendredi)
+# Mais pour être précis, voici la version optimisée vecteur :
+# On va entraîner un modèle sur une fenêtre glissante.
 
-def create_features(series_returns, carry_series):
-    df = pd.DataFrame(index=series_returns.index)
-    df['ret_1d'] = series_returns.shift(1)
-    df['ret_5d'] = series_returns.rolling(5).mean().shift(1)
-    df['ret_21d'] = series_returns.rolling(21).mean().shift(1) # Momentum mois
-    df['vol_21d'] = series_returns.rolling(21).std().shift(1)  # Volatilité
-    df['carry'] = carry_series.shift(1) # Le taux d'intérêt connu hier
-    return df.dropna()
+# Note : Pour que ce script ne prenne pas 10 heures, on va tricher intelligemment.
+# On va utiliser une régression auto-régressive simple (AR1) via OLS qui est 1000x plus rapide que ARIMA().fit()
+# et donne le même résultat pour un ARIMA(1,0,0).
 
-print("   -> Starting Rolling Training (This prevents Look-Ahead Bias)...")
-# Période de prédiction (Backtest)
-start_predict = "2018-01-01"
-predict_dates = returns_total.loc[start_predict:].index
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools.tools import add_constant
 
-# On avance par blocs de RETRAIN_FREQ (ex: 1 mois)
-# C'est beaucoup plus rapide que de réentraîner chaque jour
-for i in range(0, len(predict_dates), RETRAIN_FREQ):
-    current_date = predict_dates[i]
-    # Date de fin du bloc (ou fin des données)
-    next_date_idx = min(i + RETRAIN_FREQ, len(predict_dates))
-    block_end_date = predict_dates[next_date_idx - 1]
+print("   -> Computing Rolling AR(1) Forecasts...")
+
+for t in tickers:
+    y = returns_total[t]
+    # Lagged returns (Predictor)
+    x = y.shift(1)
     
-    # Fenêtre d'entraînement : [current_date - TRAIN_WINDOW : current_date]
-    train_end = current_date
-    train_start = train_end - pd.Timedelta(days=TRAIN_WINDOW*1.5) # *1.5 pour couvrir les jours fériés
+    # Rolling regression (Window = ARIMA_WINDOW)
+    # Formule : R_t = alpha + beta * R_{t-1} + epsilon
     
-    # Logging léger
-    if i % (RETRAIN_FREQ * 6) == 0: 
-        print(f"      Training block: {current_date.date()} -> {block_end_date.date()}")
+    # On utilise Rolling de Pandas pour calculer Covariance et Variance glissantes
+    cov_xy = y.rolling(ARIMA_WINDOW).cov(x)
+    var_x = x.rolling(ARIMA_WINDOW).var()
+    mean_x = x.rolling(ARIMA_WINDOW).mean()
+    mean_y = y.rolling(ARIMA_WINDOW).mean()
     
-    for t in tickers:
-        # 1. Création Features
-        clean = t.replace('=X', '')
-        base, quote = clean[:3], clean[3:]
-        carry_s = (rates_daily[base] - rates_daily[quote])/252 if (base in rates_daily and quote in rates_daily) else pd.Series(0, index=rates_daily.index)
-        
-        X = create_features(returns_total[t], carry_s)
-        y = returns_total[t].shift(-1) # Target = Return de DEMAIN
-        
-        # Alignement
-        common = X.index.intersection(y.index)
-        X = X.loc[common]
-        y = y.loc[common]
-        
-        # Split Train / Predict
-        # Train : Tout ce qui est AVANT la date courante
-        X_train = X.loc[train_start:current_date]
-        y_train = y.loc[train_start:current_date]
-        
-        # Predict : Le bloc actuel (ex: le mois de Janvier)
-        X_predict = X.loc[current_date:block_end_date]
-        
-        if len(X_train) < 100 or len(X_predict) == 0: continue
-        
-        # 2. Modèle XGBoost (Light Regressor)
-        model = xgb.XGBRegressor(
-            n_estimators=50,       # Pas besoin de 1000 arbres (trop lent + bruit)
-            max_depth=3,           # Arbres peu profonds (évite overfitting)
-            learning_rate=0.05,
-            objective='reg:squarederror',
-            n_jobs=1               # 1 core par modèle (car on boucle déjà)
-        )
-        
-        model.fit(X_train, y_train)
-        
-        # 3. Prédiction
-        preds = model.predict(X_predict)
-        
-        # Stockage
-        xgboost_predictions.loc[X_predict.index, t] = preds
+    # Beta = Cov(x,y) / Var(x)
+    beta = cov_xy / var_x
+    # Alpha = Mean(y) - Beta * Mean(x)
+    alpha = mean_y - beta * mean_x
+    
+    # Forecast = Alpha + Beta * Last_Return
+    # On shift(1) les params car on utilise les params calculés hier pour prédire aujourd'hui
+    # Mais attention au Look-Ahead !
+    # Le Rolling calcule la stat à la date T en incluant T.
+    # Donc pour prédire T+1, on doit utiliser les stats à T.
+    # Donc forecast_T+1 = alpha_T + beta_T * return_T
+    
+    forecast = alpha + beta * y
+    
+    # On stocke le résultat SHIFTÉ de 1 jour.
+    # Valeur à l'index T = Prédiction faite le soir de T-1 pour la journée T.
+    arima_signals[t] = forecast.shift(1)
 
-# Nettoyage final
-xgboost_predictions.dropna(how='all', inplace=True)
-returns_total = returns_total.loc[xgboost_predictions.index]
+# Nettoyage et période de Backtest
+start_bt = "2018-01-01"
+returns_total = returns_total.loc[start_bt:]
+arima_signals = arima_signals.loc[start_bt:]
 
-print(f"   ✅ AI Signals Ready.")
+print(f"   ✅ ARIMA Signals Ready (Rolling AR1 Proxy).")
 
 # ==============================================================================
 # 4. BLACK-LITTERMAN ENGINE
 # ==============================================================================
-def get_bl_xgboost_weights(curr_date):
+def get_black_litterman_weights(curr_date):
     tickers_list = returns_total.columns.tolist()
     n_assets = len(tickers_list)
     
-    # Covariance Historique
     hist_window_start = curr_date - pd.Timedelta(days=LOOKBACK_COV*1.5)
     history = returns_total.loc[hist_window_start:curr_date].tail(LOOKBACK_COV)
     
@@ -184,15 +161,18 @@ def get_bl_xgboost_weights(curr_date):
     w_mkt = np.ones(n_assets) / n_assets 
     pi = RISK_AVERSION_DELTA * sigma.dot(w_mkt)
     
-    # --- XGBOOST VIEWS ---
-    if curr_date not in xgboost_predictions.index: return np.zeros(n_assets)
+    # --- ARIMA VIEWS ---
+    if curr_date not in arima_signals.index: return np.zeros(n_assets)
     
-    # Le signal brut est la prédiction de rendement journalier (ex: 0.001 pour 0.1%)
-    raw_signal = xgboost_predictions.loc[curr_date].fillna(0)
+    # Signal Brut (Rendement espéré journalier)
+    raw_signal = arima_signals.loc[curr_date]
     
-    # On sélectionne les meilleures opportunités (Top/Bottom)
+    # On filtre : On ne prend position que si le signal est "fort" (relatif)
+    # On trie par force du signal (absolue ou relative)
     ranked = raw_signal.sort_values(ascending=False)
-    views_assets = ranked.head(4).index.tolist() + ranked.tail(4).index.tolist()
+    
+    # Top 3 Long et Top 3 Short
+    views_assets = ranked.head(3).index.tolist() + ranked.tail(3).index.tolist()
     
     P, Q, Omega_list = [], [], []
     
@@ -202,10 +182,11 @@ def get_bl_xgboost_weights(curr_date):
         
         row = np.zeros(n_assets); row[idx] = 1; P.append(row)
         
-        # On annualise la prédiction journalière pour l'utiliser comme Vue BL
-        # Si XGB prédit +0.1% demain -> ~ +25% annuel. On sature avec tanh.
-        annualized_pred = val * 252 
-        view_ret = np.tanh(annualized_pred) * 0.30 
+        # Le signal ARIMA est petit (ex: 0.0005 journalier).
+        # On l'annualise (*252) ou on l'amplifie pour en faire une "Vue" BL convaincante
+        # On utilise tanh pour saturer à +/- 30% annuel
+        annualized_signal = val * 252
+        view_ret = np.tanh(annualized_signal * 2.0) * 0.30 
         Q.append(view_ret)
         
         variance = sigma.iloc[idx, idx]
@@ -240,9 +221,9 @@ def get_bl_xgboost_weights(curr_date):
         return np.zeros(n_assets)
 
 # ==============================================================================
-# 5. BACKTEST ENGINE (Trade-On-Close)
+# 5. BACKTEST ENGINE (TRADE-ON-CLOSE)
 # ==============================================================================
-print("\n[3] Executing Backtest...")
+print("\n[3] Executing ARIMA Backtest...")
 
 rebal_dates = returns_total.resample('W-FRI').last().index
 daily_dates = returns_total.index
@@ -257,7 +238,7 @@ strategy_returns = []
 last_log_month = 0
 
 print("-" * 100)
-print(f"{'DATE':<12} | {'EQUITY':<12} | {'LEV':<5} | {'ALLOCATION (XGBoost Views)'}")
+print(f"{'DATE':<12} | {'EQUITY':<12} | {'LEV':<5} | {'ALLOCATION (ARIMA Views)'}")
 print("-" * 100)
 
 for i, d in enumerate(daily_dates[1:]):
@@ -270,7 +251,7 @@ for i, d in enumerate(daily_dates[1:]):
     # 2. Rebal
     cost = 0.0
     if d in rebal_set:
-        target_weights = get_bl_xgboost_weights(d)
+        target_weights = get_black_litterman_weights(d)
         target_weights[np.abs(target_weights) < 0.02] = 0 
         
         turnover = np.sum(np.abs(target_weights - current_weights_daily))
@@ -301,7 +282,7 @@ print("-" * 100)
 print(f"Final Capital: {capital:,.0f} $")
 
 # ==============================================================================
-# 6. REPORTING
+# 6. REPORTING & CHARTS
 # ==============================================================================
 def generate_reports():
     print("\n[4] Generating Reports...")
@@ -309,13 +290,15 @@ def generate_reports():
     returns = pd.read_csv(FILE_RETURNS, index_col=0, parse_dates=True)
     strat_ret = returns['STRATEGY']
     
+    # Metrics
     vol = strat_ret.std() * np.sqrt(TRADING_DAYS)
     ret_ann = strat_ret.mean() * TRADING_DAYS
     sharpe = ret_ann / vol if vol > 0 else 0
     dd = (df_equity['Equity'] - df_equity['Equity'].cummax()) / df_equity['Equity'].cummax()
     max_dd = dd.min()
     
-    print(f"\n--- PERFORMANCE (XGBOOST BL) ---")
+    print(f"\n--- PERFORMANCE (ARIMA BL) ---")
+    print(f"Total Return       : {(capital/TARGET_BUDGET)-1:+.2%}")
     print(f"Annualized Return  : {ret_ann:+.2%}")
     print(f"Sharpe Ratio       : {sharpe:.2f}")
     print(f"Max Drawdown       : {max_dd:.2%}")
@@ -323,9 +306,9 @@ def generate_reports():
     # Charts
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
     
-    ax1.plot(df_equity['Equity'], color='#2ca02c', linewidth=1.5, label='XGBoost Strategy')
+    ax1.plot(df_equity['Equity'], color='purple', linewidth=1.5, label='ARIMA BL Strategy')
     ax1.axhline(TARGET_BUDGET, color='black', linestyle='--')
-    ax1.set_title("Strategy Performance: XGBoost AI + Black-Litterman", fontsize=14)
+    ax1.set_title("Strategy Performance: ARIMA-Driven Black-Litterman", fontsize=14)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -335,7 +318,7 @@ def generate_reports():
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "CHART_XGB_PERF.png"), dpi=150)
+    plt.savefig(os.path.join(OUTPUT_DIR, "CHART_ARIMA_PERF.png"), dpi=150)
     print("-> Charts saved.")
     plt.show()
 

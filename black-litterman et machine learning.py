@@ -34,7 +34,7 @@ TRAIN_WINDOW = 500           # On utilise les 2 dernières années pour entraîn
 RISK_AVERSION_DELTA = 2.5    
 TAU = 0.05                   
 MAX_WEIGHT = 0.30            
-GROSS_LEVERAGE = 1.5         # Levier 1.5x
+GROSS_LEVERAGE = 5         # Levier 5x
 
 # --- Risk Params ---
 CONFIDENCE_LEVEL = 0.95  
