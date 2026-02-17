@@ -22,31 +22,47 @@ FILE_RETURNS = os.path.join(OUTPUT_DIR, "MASTER_RETURNS_BL.csv")
 
 # --- Strategy Parameters ---
 TARGET_BUDGET = 1000000.0   
-TRANSACTION_COST = 0.0005    # 5 bps par trade
 LOOKBACK_MOMENTUM = 252      # 1 An (Signal robuste)
 LOOKBACK_COV = 126           # 6 Mois (Structure de risque plus réactive)
+
+# --- Transaction Costs (Spreads moyens + Slippage) ---
+DEFAULT_COST = 0.0005 # Fallback (5 bps)
+
+# --- BROKER REALISM ---
+# Marge que le broker prend sur le différentiel de taux (0.50% annuel standard)
+BROKER_SWAP_MARKUP = 0.0050 
+
+SPECIFIC_SPREADS = {
+    # MAJORS
+    'EURUSD': 0.00012, 'USDJPY': 0.00012, 'GBPUSD': 0.00015, 
+    'AUDUSD': 0.00015, 'USDCAD': 0.00018, 'USDCHF': 0.00018, 'NZDUSD': 0.00020,
+    
+    # CROSSES & MINORS
+    'EURGBP': 0.00020, 'EURJPY': 0.00022, 'GBPJPY': 0.00028,
+    'AUDJPY': 0.00025, 'CADJPY': 0.00025, 'CHFJPY': 0.00025,
+    'EURAUD': 0.00030, 'EURCAD': 0.00030, 'GBPAUD': 0.00035, 'GBPCAD': 0.00035,
+    'AUDNZD': 0.00035, 'AUDCAD': 0.00030,
+    
+    # EXOTICS / VOLATILE
+    'USDMXN': 0.00100, 'USDZAR': 0.00120, 'USDTRY': 0.00200, 
+    'USDSGD': 0.00030, 'USDCNH': 0.00040, 'USDSEK': 0.00040, 'USDNOK': 0.00040,
+    'EURTRY': 0.00250, 'EURZAR': 0.00150
+}
 
 # --- Black-Litterman Parameters ---
 RISK_AVERSION_DELTA = 2.5    
 TAU = 0.05                   
-MAX_WEIGHT = 0.30            # Max 30% par devise
-GROSS_LEVERAGE = 1.2         # Levier total max 120%
+MAX_WEIGHT = 1.0             # Max 100% par devise (Risk ON)
+GROSS_LEVERAGE = 5.0         # Levier total max x5 (Risk ON)
 
 # --- Risk Analysis Parameters ---
 CONFIDENCE_LEVEL = 0.95  
 TRADING_DAYS = 252        
 MC_SIMULATIONS = 10000    
 
-# --- Mapping des Paires et Taux ---
-# IMPORTANT : On définit quelle devise utilise quel taux FRED
-rate_mapping = {
-    'USD': 'USD', 'EUR': 'EUR', 'JPY': 'JPY', 'GBP': 'GBP',
-    'CHF': 'CHF', 'AUD': 'AUD', 'CAD': 'CAD', 'NZD': 'NZD',
-    'MXN': 'MXN', 'ZAR': 'ZAR', 'TRY': 'TRY', 'NOK': 'NOK', 'SEK': 'SEK'
-}
-
 print("="*80)
-print(f" 🚀 STARTING: ULTIMATE BL FX STRATEGY (DATA: FRED + YAHOO LOCAL)")
+print(f" 🚀 STARTING: ULTIMATE BL FX STRATEGY (AGGRESSIVE MODE)")
+print(f"    LEVERAGE: {GROSS_LEVERAGE}x | MAX POS: {MAX_WEIGHT*100}% | REALISTIC COSTS: ON")
 print("="*80)
 
 # ==============================================================================
@@ -65,7 +81,7 @@ try:
     rates_daily = rates_daily.loc[common_idx]
     
     # Filtrage par date de début du backtest
-    prices = prices.loc["2015-01-01":] # On prend large pour le calcul du momentum
+    prices = prices.loc["2015-01-01":] 
     rates_daily = rates_daily.loc["2015-01-01":]
     
     tickers = prices.columns.tolist()
@@ -73,13 +89,12 @@ try:
 
 except FileNotFoundError:
     print("❌ CRITICAL ERROR: Data files not found in 'data/' folder.")
-    print("   -> Please run 'data_downloader.py' first.")
     exit()
 
 # ==============================================================================
-# 3. SIGNAL GENERATION (MOMENTUM + CARRY)
+# 3. SIGNAL GENERATION (MOMENTUM + REALISTIC CARRY)
 # ==============================================================================
-print("[2] Calculating Total Returns (Price + Carry) & Momentum...")
+print("[2] Calculating Total Returns (Price + Carry - Broker Markup)...")
 
 returns_total = pd.DataFrame(index=prices.index, columns=tickers)
 momentum_score = pd.DataFrame(index=prices.index, columns=tickers)
@@ -94,31 +109,34 @@ for t in tickers:
     # 1. Price Return
     r_price = prices[t].pct_change()
     
-    # 2. Carry Return (Daily Interest Differential)
-    # Rate Base - Rate Quote (Annualized -> Daily)
+    # 2. Realistic Carry Return (Daily Interest Differential - Broker Markup)
     r_carry = 0.0
     if base in rates_daily.columns and quote in rates_daily.columns:
-        # Les taux dans le CSV sont déjà en décimal (0.05)
-        # On divise par 252 pour avoir le taux journalier
-        r_carry = (rates_daily[base] - rates_daily[quote]) / 252.0
+        # Différentiel brut
+        raw_diff = rates_daily[base] - rates_daily[quote]
+        
+        # Application du Markup Broker (Haircut sur le rendement)
+        # On soustrait la marge du broker du différentiel brut
+        realistic_diff = raw_diff - BROKER_SWAP_MARKUP
+        
+        # Conversion en journalier
+        r_carry = realistic_diff / 252.0
     
     # Total Return
     returns_total[t] = r_price + r_carry
     
     # 3. Momentum Signal (12-Month Total Return)
-    # On utilise log returns pour l'additivité temporelle
     log_rets = np.log(1 + returns_total[t])
-    # Shift(1) pour éviter le Look-Ahead Bias (on utilise la donnée d'hier)
     momentum_score[t] = log_rets.rolling(LOOKBACK_MOMENTUM).sum().shift(1)
 
 returns_total.dropna(inplace=True)
 momentum_score.dropna(inplace=True)
 
-# On restreint le backtest à la période demandée (après calcul des indicateurs)
+# On restreint le backtest à la période demandée
 start_bt = "2018-01-01"
 returns_total = returns_total.loc[start_bt:]
 momentum_score = momentum_score.loc[start_bt:]
-prices = prices.loc[start_bt:] # Pour alignement visuel
+prices = prices.loc[start_bt:]
 
 print(f"   ✅ Signal Ready. Backtest Period: {returns_total.index[0].date()} -> {returns_total.index[-1].date()}")
 
@@ -159,7 +177,6 @@ def get_black_litterman_weights(curr_date):
         row = np.zeros(n_assets); row[idx] = 1; P.append(row)
         
         # Vecteur Q (View Return)
-        # On transforme le score momentum en espérance de rendement (tanh pour borner)
         # Si Momentum fort -> On espère +20% annualisé
         view_ret = np.tanh(mom_val) * 0.20 
         Q.append(view_ret)
@@ -201,15 +218,15 @@ def get_black_litterman_weights(curr_date):
         return np.zeros(n_assets)
 
 # ==============================================================================
-# 5. BACKTEST ENGINE (CORRIGÉ : NO LOOK-AHEAD BIAS)
+# 5. BACKTEST ENGINE (W-WED REBAL + REALISTIC COSTS)
 # ==============================================================================
 print("\n[3] Executing Backtest (Strict Mode)...")
 
-rebal_dates = returns_total.resample('W-FRI').last().index
+rebal_dates = returns_total.resample('W-WED').last().index
 daily_dates = returns_total.index
 rebal_set = set(rebal_dates)
 
-# Initialisation : On commence neutre ou avec une allocation initiale
+# Initialisation
 current_weights_daily = np.zeros(len(tickers)) 
 
 capital = TARGET_BUDGET
@@ -219,39 +236,41 @@ strategy_returns = []
 
 last_log_month = 0
 
+# --- PRE-CALCUL DES FRAIS PAR PAIRE ---
+costs_list = []
+for t in tickers:
+    clean_ticker = t.replace('=X', '') 
+    cost_val = SPECIFIC_SPREADS.get(clean_ticker, DEFAULT_COST)
+    costs_list.append(cost_val)
+cost_vector = np.array(costs_list)
+# -------------------------------------
+
 print("-" * 100)
 print(f"{'DATE':<12} | {'EQUITY ($)':<12} | {'ALLOCATION (Effective for NEXT Period)'}")
 print("-" * 100)
 
-# On commence la boucle.
-# Attention : current_weights_daily contient les poids décidés la veille (ou au dernier rebal)
 for i, d in enumerate(daily_dates[1:]):
     
-    # 1. D'ABORD : Calcul du PnL de la journée (On subit le marché avec les poids actuels)
-    # C'est ici qu'on est réaliste : on utilise les poids décidés AVANT de connaître le rendement du jour.
+    # 1. PnL Journalier
     day_ret_vector = returns_total.loc[d]
     port_ret = np.dot(current_weights_daily, day_ret_vector)
     
-    # Mise à jour du capital AVANT frais de rebalancement
     capital *= (1 + port_ret)
     
-    # 2. ENSUITE : Vérification du Rebalancement (À la clôture, pour demain)
+    # 2. Rebalancement (Mercredi)
     cost = 0.0
     if d in rebal_set:
-        # On calcule les nouveaux poids basés sur les infos disponibles ce soir (d)
-        # Note : momentum_score est déjà shifté, donc c'est safe. 
-        # La covariance utilise les données jusqu'à ce soir, c'est OK car on appliquera ces poids DEMAIN.
         target_weights = get_black_litterman_weights(d)
         target_weights[np.abs(target_weights) < 0.02] = 0 
         
-        # On calcule les frais de transaction pour modifier le portefeuille
-        turnover = np.sum(np.abs(target_weights - current_weights_daily))
-        cost = turnover * TRANSACTION_COST
+        # Frais de transaction
+        turnover_vector = np.abs(target_weights - current_weights_daily)
         
-        # On applique les frais au capital
-        capital -= (capital * cost) # Ou simplement soustraire le montant
+        # Calcul des frais spécifiques
+        cost = np.sum(turnover_vector * cost_vector)
         
-        # On met à jour les poids : ILS SERONT ACTIFS POUR LA PROCHAINE ITÉRATION (LUNDI)
+        capital -= (capital * cost)
+        
         current_weights_daily = target_weights
         
         # LOGGING
@@ -269,11 +288,9 @@ for i, d in enumerate(daily_dates[1:]):
             print(f"{d.date()} | {capital:,.0f} | L: [{l_str}] | S: [{s_str}]")
             last_log_month = d.month
 
-    # Stockage des résultats
-    # Note : port_ret est brut ici, les coûts sont déduits du capital directement
+    # Stockage
     equity_curve.append(capital)
     equity_dates.append(d)
-    # Pour le fichier CSV, on enregistre le rendement net approximatif
     net_ret = port_ret - (cost if d in rebal_set else 0.0)
     strategy_returns.append(net_ret)
 

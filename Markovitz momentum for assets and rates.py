@@ -22,9 +22,30 @@ FILE_RETURNS = os.path.join(OUTPUT_DIR, "MASTER_RETURNS_MVO.csv")
 
 # --- Strategy Parameters ---
 TARGET_BUDGET = 1000000.0   
-TRANSACTION_COST = 0.0005    # 5 bps par trade
 LOOKBACK_MOMENTUM = 252      # 1 An (Signal)
 LOOKBACK_COV = 126           # 6 Mois (Risque)
+
+# --- Transaction Costs (Spreads moyens + Slippage) ---
+# Valeurs estimées en valeur absolue (0.0001 = 1 pip/bps pour une paire à 1.0000)
+# Majors: ~1-1.5 bps | Crosses: ~2-4 bps | Exotics: ~10+ bps
+DEFAULT_COST = 0.0005 # Fallback pour les paires inconnues (5 bps)
+
+SPECIFIC_SPREADS = {
+    # MAJORS
+    'EURUSD': 0.00012, 'USDJPY': 0.00012, 'GBPUSD': 0.00015, 
+    'AUDUSD': 0.00015, 'USDCAD': 0.00018, 'USDCHF': 0.00018, 'NZDUSD': 0.00020,
+    
+    # CROSSES & MINORS
+    'EURGBP': 0.00020, 'EURJPY': 0.00022, 'GBPJPY': 0.00028,
+    'AUDJPY': 0.00025, 'CADJPY': 0.00025, 'CHFJPY': 0.00025,
+    'EURAUD': 0.00030, 'EURCAD': 0.00030, 'GBPAUD': 0.00035, 'GBPCAD': 0.00035,
+    'AUDNZD': 0.00035, 'AUDCAD': 0.00030,
+    
+    # EXOTICS / VOLATILE
+    'USDMXN': 0.00100, 'USDZAR': 0.00120, 'USDTRY': 0.00200, 
+    'USDSGD': 0.00030, 'USDCNH': 0.00040, 'USDSEK': 0.00040, 'USDNOK': 0.00040,
+    'EURTRY': 0.00250, 'EURZAR': 0.00150
+}
 
 # --- Markowitz Parameters ---
 RISK_AVERSION_DELTA = 2.5    
@@ -175,6 +196,17 @@ strategy_returns = []
 
 last_log_month = 0
 
+# --- PRE-CALCUL DES FRAIS PAR PAIRE ---
+# On construit un vecteur numpy aligné avec 'tickers' contenant le coût de chaque paire
+costs_list = []
+for t in tickers:
+    clean_ticker = t.replace('=X', '') # Nettoyage si format Yahoo
+    # On cherche dans la map, sinon on prend le default
+    cost_val = SPECIFIC_SPREADS.get(clean_ticker, DEFAULT_COST)
+    costs_list.append(cost_val)
+cost_vector = np.array(costs_list)
+# -------------------------------------
+
 print("-" * 100)
 print(f"{'DATE':<12} | {'EQUITY ($)':<12} | {'ALLOCATION (Markowitz Optimized)'}")
 print("-" * 100)
@@ -192,8 +224,12 @@ for i, d in enumerate(daily_dates[1:]):
         target_weights = get_markowitz_weights(d)
         target_weights[np.abs(target_weights) < 0.02] = 0 
         
-        turnover = np.sum(np.abs(target_weights - current_weights_daily))
-        cost = turnover * TRANSACTION_COST
+        # Calcul du turnover par actif
+        turnover_vector = np.abs(target_weights - current_weights_daily)
+        
+        # Calcul des frais spécifiques : Somme(Turnover_i * Cost_i)
+        cost = np.sum(turnover_vector * cost_vector)
+        
         capital -= (capital * cost)
         
         current_weights_daily = target_weights
