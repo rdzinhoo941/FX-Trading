@@ -339,8 +339,8 @@ def backtest_entropy_pooling(
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="Entropy Pooling FX strategy backtest")
-    ap.add_argument("--fx_csv", type=str, default="data_forex_prices.csv")
-    ap.add_argument("--rates_csv", type=str, default="data_fred_rates.csv")
+    ap.add_argument("--fx_csv", type=str, default="data/data_forex_prices.csv")
+    ap.add_argument("--rates_csv", type=str, default="data/data_fred_rates.csv")
 
     ap.add_argument("--lookback", type=int, default=252)
     ap.add_argument("--rebalance_every", type=int, default=21)
