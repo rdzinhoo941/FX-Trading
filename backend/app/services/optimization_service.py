@@ -4,19 +4,19 @@ Optimization service – portfolio construction.
     Markowitz / entropy-pooling / risk-parity optimiser.  The function
     signature and return types should stay the same.
 """
-
+from typing import List
 import numpy as np
 from app.schemas import AllocationRow, KpiSummary
 
 
 def generate_allocation(
-    pairs: list[str],
+    pairs: List[str],
     initial_capital: float,
     model: str,
     target_return_pct: float,
     risk_aversion: str,
     seed: int = 42,
-) -> tuple[list[AllocationRow], KpiSummary]:
+) -> tuple[List[AllocationRow], KpiSummary]:
     rng = np.random.default_rng(seed)
     n = len(pairs)
 

@@ -3,7 +3,7 @@ Forecast service – NAV-level forecasting.
 >>> WHERE TO PLUG REAL MODELS: replace generate_forecast() with your
     LSTM / Prophet / GARCH model.  Feed it portfolio NAV history.
 """
-
+from typing import List
 import numpy as np
 from datetime import datetime, timedelta
 from app.schemas import ForecastPoint, ForecastMetrics, ForecastResponse, Signal
@@ -18,7 +18,7 @@ def generate_forecast(nav_last: float = 101_000, seed: int = 42) -> ForecastResp
     # historical NAV
     hist_rets = rng.normal(0.0004, 0.006, n_hist)
     nav = nav_last * 0.97
-    series: list[ForecastPoint] = []
+    series: List[ForecastPoint] = []
     for i in range(n_hist):
         nav *= 1 + hist_rets[i]
         d = (today - timedelta(days=n_hist - i)).strftime("%Y-%m-%d")

@@ -3,12 +3,12 @@ Correlation service – cross-pair analytics.
 >>> WHERE TO PLUG REAL MODELS: replace with realized correlation from
     historical returns, DCC-GARCH, or shrinkage estimators.
 """
-
+from typing import List
 import numpy as np
 from app.schemas import CorrelationMatrix, ScatterPoint, CorrelationResponse
 
 
-def generate_correlations(pairs: list[str], seed: int = 42) -> CorrelationResponse:
+def generate_correlations(pairs: List[str], seed: int = 42) -> CorrelationResponse:
     rng = np.random.default_rng(seed)
     n = len(pairs)
 

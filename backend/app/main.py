@@ -2,6 +2,7 @@
 FastAPI backend for FX Portfolio Optimizer.
 Run with: uvicorn app.main:app --reload --port 8000
 """
+from typing import Dict
 
 import uuid
 from fastapi import FastAPI, HTTPException
@@ -39,7 +40,7 @@ app.add_middleware(
 )
 
 # ── In-memory session store ───────────────────────────────────────────────────
-sessions: dict[str, dict] = {}
+sessions: Dict[str, dict] = {}
 
 
 def _get_session(session_id: str) -> dict:

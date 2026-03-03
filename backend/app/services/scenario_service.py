@@ -3,7 +3,7 @@ Scenario service – stress-test / what-if analysis.
 >>> WHERE TO PLUG REAL MODELS: replace apply_scenario() with factor-based
     stress tests, or Monte-Carlo shocking.
 """
-
+from typing import List
 import numpy as np
 from app.schemas import AllocationRow, ScenarioRow, ScenarioResponse
 
@@ -16,7 +16,7 @@ PREDEFINED = {
 
 
 def apply_scenario(
-    allocation: list[AllocationRow],
+    allocation: List[AllocationRow],
     scenario_type: str,
     pair: str | None = None,
     shock_pct: float | None = None,
