@@ -74,16 +74,18 @@ def generate_portfolio(req: ProfileRequest):
 @app.get("/api/portfolio/summary", response_model=PortfolioSummary)
 def portfolio_summary(session_id: str):
     s = _get_session(session_id)
-    rng = np.random.default_rng(42)
-    today = datetime(2025, 6, 15)
-    nav = 100.0
-    peak = 100.0
-    nav_series = []
-    for i in range(90):
-        nav *= 1 + rng.normal(0.0003, 0.005)
-        peak = max(peak, nav)
-        d = (today - timedelta(days=90 - i)).strftime("%Y-%m-%d")
-        nav_series.append(NavPoint(date=d, nav=round(nav, 4), peak=round(peak, 4)))
+    from app.services.results_service import load_nav_series
+
+    nav_data = load_nav_series("markowitz")
+    
+    nav_series = [
+        NavPoint(
+            date=item["date"],
+            nav=round(item["value"], 4),
+            peak=round(item["value"], 4)
+        )
+        for item in nav_data
+    ]
 
     return PortfolioSummary(
         allocation=s["allocation"],
