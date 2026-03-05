@@ -216,13 +216,111 @@ def get_black_litterman_weights(curr_date):
         return res.x
     except:
         return np.zeros(n_assets)
+"""    
+# ==============================================================================
+# 5. BACKTEST ENGINE (CORRIGÉ POUR 1 AN)
+# ==============================================================================
+print("\n[3] Executing Backtest (Strict Mode)...")
 
+# 1. DÉFINITION DES DATES DE REBALANCEMENT (1er jour de trading de chaque année)
+# On groupe par année et on prend le premier index valide (évite les jours fériés)
+rebal_dates = returns_total.groupby(returns_total.index.year).apply(lambda x: x.index[0]).tolist()
+daily_dates = returns_total.index
+rebal_set = set(rebal_dates)
+
+print(f" -> Rebalancing Dates: {[d.date() for d in rebal_dates]}")
+
+# 2. BOOTSTRAP (INITIALISATION FORCÉE AU JOUR 0)
+# Comme la boucle commence à J+1, on doit calculer l'allocation initiale manuellement
+# sinon on rate le départ de 2024.
+print(" -> Initializing portfolio weights at Start Date...")
+current_weights_daily = get_black_litterman_weights(daily_dates[0])
+
+# On applique les frais d'entrée initiaux
+costs_list = []
+for t in tickers:
+    clean_ticker = t.replace('=X', '')
+    cost_val = SPECIFIC_SPREADS.get(clean_ticker, DEFAULT_COST)
+    costs_list.append(cost_val)
+cost_vector = np.array(costs_list)
+
+# Frais initiaux (On passe de 0 à l'allocation initiale)
+initial_cost = np.sum(np.abs(current_weights_daily) * cost_vector)
+capital = TARGET_BUDGET * (1 - initial_cost) # On déduit les frais tout de suite
+
+equity_curve = [capital]
+equity_dates = [daily_dates[0]]
+strategy_returns = []
+
+last_log_month = 0
+
+print("-" * 100)
+print(f"{'DATE':<12} | {'EQUITY ($)':<12} | {'ALLOCATION (Effective for NEXT Period)'}")
+print("-" * 100)
+
+# On affiche l'allocation initiale
+pos_longs = [f"{tickers[i].replace('=X','')}:{w:.0%}" for i, w in enumerate(current_weights_daily) if w > 0.05]
+pos_shorts = [f"{tickers[i].replace('=X','')}:{w:.0%}" for i, w in enumerate(current_weights_daily) if w < -0.05]
+print(f"{daily_dates[0].date()} | {capital:,.0f} | L: {pos_longs} | S: {pos_shorts}")
+
+
+# 3. BOUCLE DE BACKTEST (Commence à J+1)
+for i, d in enumerate(daily_dates[1:]):
+    
+    # A. PnL Journalier (Basé sur les poids décidés la veille ou au rebal précédent)
+    day_ret_vector = returns_total.loc[d]
+    port_ret = np.dot(current_weights_daily, day_ret_vector)
+    
+    capital *= (1 + port_ret)
+    
+    # B. Rebalancement (Si c'est le premier jour de l'année 2025, 2026...)
+    cost = 0.0
+    if d in rebal_set:
+        print(f" -> Rebalancing triggered on {d.date()}")
+        target_weights = get_black_litterman_weights(d)
+        
+        # Nettoyage des petits poids (< 2%)
+        target_weights[np.abs(target_weights) < 0.02] = 0 
+        
+        # Calcul du Turnover et des Frais
+        turnover_vector = np.abs(target_weights - current_weights_daily)
+        cost = np.sum(turnover_vector * cost_vector)
+        
+        capital -= (capital * cost)
+        current_weights_daily = target_weights
+        
+        # LOGGING (Uniquement lors des changements)
+        pos_longs = []
+        pos_shorts = []
+        for idx, w in enumerate(target_weights):
+            t_name = tickers[idx].replace('=X', '')
+            if w > 0.05: pos_longs.append(f"{t_name}:{w:.0%}")
+            elif w < -0.05: pos_shorts.append(f"{t_name}:{w:.0%}")
+        
+        l_str = ", ".join(pos_longs) if pos_longs else "None"
+        s_str = ", ".join(pos_shorts) if pos_shorts else "None"
+        print(f"{d.date()} | {capital:,.0f} | L: [{l_str}] | S: [{s_str}]")
+
+    # Stockage
+    equity_curve.append(capital)
+    equity_dates.append(d)
+    net_ret = port_ret - (cost if d in rebal_set else 0.0)
+    strategy_returns.append(net_ret)
+
+# Export Data
+df_export = returns_total.loc[daily_dates[1:]].copy()
+df_export['STRATEGY'] = strategy_returns
+df_export.to_csv(FILE_RETURNS)
+
+print("-" * 100)
+print(f"Backtest Complete. Final Capital: {capital:,.0f} $")
 # ==============================================================================
 # 5. BACKTEST ENGINE (W-WED REBAL + REALISTIC COSTS)
 # ==============================================================================
 print("\n[3] Executing Backtest (Strict Mode)...")
 
-rebal_dates = returns_total.resample('W-WED').last().index
+rebal_dates = returns_total.resample('WOM-1WED').last().index # W-WED
+#rebal_dates = returns_total.groupby(returns_total.index.year).apply(lambda x: x.index[0]).values
 daily_dates = returns_total.index
 rebal_set = set(rebal_dates)
 
@@ -301,7 +399,99 @@ df_export.to_csv(FILE_RETURNS)
 
 print("-" * 100)
 print(f"Backtest Complete. Final Capital: {capital:,.0f} $")
+"""
+# ==============================================================================
+# 5. BACKTEST ENGINE (TRIMESTRIEL / QUARTERLY)
+# ==============================================================================
+print("\n[3] Executing Backtest (Quarterly Rebalancing)...")
 
+# 1. DÉFINITION DES DATES DE REBALANCEMENT (Chaque Trimestre)
+# On groupe par Année ET par Trimestre pour trouver le 1er jour de trading de chaque trimestre
+rebal_dates = returns_total.groupby([returns_total.index.year, returns_total.index.quarter]).apply(lambda x: x.index[0]).tolist()
+
+daily_dates = returns_total.index
+rebal_set = set(rebal_dates)
+
+print(f" -> Rebalancing Dates ({len(rebal_dates)} periods): {[d.date() for d in rebal_dates]}")
+
+# 2. BOOTSTRAP (INITIALISATION FORCÉE AU JOUR 0)
+print(" -> Initializing portfolio weights at Start Date...")
+# On force le calcul pour le tout premier jour
+current_weights_daily = get_black_litterman_weights(daily_dates[0])
+
+# Prépare les coûts
+costs_list = []
+for t in tickers:
+    clean_ticker = t.replace('=X', '')
+    cost_val = SPECIFIC_SPREADS.get(clean_ticker, DEFAULT_COST)
+    costs_list.append(cost_val)
+cost_vector = np.array(costs_list)
+
+# Frais initiaux
+initial_cost = np.sum(np.abs(current_weights_daily) * cost_vector)
+capital = TARGET_BUDGET * (1 - initial_cost)
+
+equity_curve = [capital]
+equity_dates = [daily_dates[0]]
+strategy_returns = []
+
+print("-" * 100)
+print(f"{'DATE':<12} | {'EQUITY ($)':<12} | {'ALLOCATION (Effective for NEXT Period)'}")
+print("-" * 100)
+
+# Affiche position initiale
+pos_longs = [f"{tickers[i].replace('=X','')}:{w:.0%}" for i, w in enumerate(current_weights_daily) if w > 0.05]
+pos_shorts = [f"{tickers[i].replace('=X','')}:{w:.0%}" for i, w in enumerate(current_weights_daily) if w < -0.05]
+print(f"{daily_dates[0].date()} | {capital:,.0f} | L: {pos_longs} | S: {pos_shorts}")
+
+# 3. BOUCLE DE BACKTEST (Commence à J+1)
+for i, d in enumerate(daily_dates[1:]):
+    
+    # A. PnL Journalier
+    day_ret_vector = returns_total.loc[d]
+    port_ret = np.dot(current_weights_daily, day_ret_vector)
+    
+    capital *= (1 + port_ret)
+    
+    # B. Rebalancement (Si c'est le début d'un trimestre)
+    cost = 0.0
+    if d in rebal_set:
+        print(f" -> Rebalancing triggered on {d.date()}") # Debug info
+        target_weights = get_black_litterman_weights(d)
+        
+        target_weights[np.abs(target_weights) < 0.02] = 0 
+        
+        turnover_vector = np.abs(target_weights - current_weights_daily)
+        cost = np.sum(turnover_vector * cost_vector)
+        
+        capital -= (capital * cost)
+        current_weights_daily = target_weights
+        
+        # LOGGING
+        pos_longs = []
+        pos_shorts = []
+        for idx, w in enumerate(target_weights):
+            t_name = tickers[idx].replace('=X', '')
+            if w > 0.05: pos_longs.append(f"{t_name}:{w:.0%}")
+            elif w < -0.05: pos_shorts.append(f"{t_name}:{w:.0%}")
+        
+        l_str = ", ".join(pos_longs) if pos_longs else "None"
+        s_str = ", ".join(pos_shorts) if pos_shorts else "None"
+        print(f"{d.date()} | {capital:,.0f} | L: [{l_str}] | S: [{s_str}]")
+
+    # Stockage
+    equity_curve.append(capital)
+    equity_dates.append(d)
+    net_ret = port_ret - (cost if d in rebal_set else 0.0)
+    strategy_returns.append(net_ret)
+
+# Export Data
+df_export = returns_total.loc[daily_dates[1:]].copy()
+df_export['STRATEGY'] = strategy_returns
+df_export.to_csv(FILE_RETURNS)
+
+print("-" * 100)
+print(f"Backtest Complete. Final Capital: {capital:,.0f} $")
 # ==============================================================================
 # 6. RISK ANALYSIS
 # ==============================================================================
