@@ -1,0 +1,1425 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║  FX PORTFOLIO FRAMEWORK v5 — CT + MT uniquement                                ║
+║                                                                                ║
+║  Structure :                                                                   ║
+║    1. CONFIG         — paramètres, spreads, profils                            ║
+║    2. DATA           — chargement CSV, univers FX, carry                       ║
+║    3. SIGNAL         — wavelet, Hurst/Garcin, HMM régimes, GARCH              ║
+║    4. FEATURES       — 20 features par paire (CT + MT)                         ║
+║    5. ML MODELS      — CT: Ridge + LightGBM  |  MT: GB + Transformer          ║
+║    6. STRATEGIES     — CT, MT, Combiné (avec spreads réels)                    ║
+║    7. BACKTEST       — walk-forward OOS, métriques, plots                      ║
+║    8. MAIN           — pipeline complet                                         ║
+║                                                                                ║
+║  2 modèles par horizon, pondérés selon le profil utilisateur.                 ║
+║  Spreads spécifiques par paire (majors, crosses, exotics).                    ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import os, sys, gc, math, warnings
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import pywt
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+from scipy.optimize import minimize
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.metrics import accuracy_score
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import RidgeClassifier, LinearRegression
+from sklearn.mixture import GaussianMixture
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+np.random.seed(42)
+
+# ── Imports optionnels ──
+try:
+    import lightgbm as lgb
+    HAS_LGBM = True
+except ImportError:
+    HAS_LGBM = False
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  1. CONFIG                                                                    ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+TRADING_DAYS   = 252
+DATA_DIR       = "."
+OUTPUT_DIR     = "results"
+BACKTEST_START = "2020-01-01"
+
+# ── Chemins (adapter selon votre machine) ──
+FILE_PRICES = os.path.join(DATA_DIR, "data_forex_prices.csv")
+FILE_RATES  = os.path.join(DATA_DIR, "data_fred_rates.csv")
+
+# ── Univers FX ──
+PAIR_MAP = {
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
+    "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X", "NZDUSD": "NZDUSD=X",
+    "USDCHF": "USDCHF=X",
+    "EURGBP": "EURGBP=X", "EURJPY": "EURJPY=X", "AUDJPY": "AUDJPY=X",
+    "NZDJPY": "NZDJPY=X",
+    "USDMXN": "USDMXN=X", "USDNOK": "USDNOK=X", "USDSEK": "USDSEK=X",
+    "USDSGD": "USDSGD=X", "USDTRY": "USDTRY=X", "USDZAR": "USDZAR=X",
+}
+TICKER_TO_PAIR = {v: k for k, v in PAIR_MAP.items()}
+
+# ── Spreads réels par paire (en prix, pas en pips) ──
+SPECIFIC_SPREADS = {
+    'EURUSD': 0.00012, 'USDJPY': 0.00012, 'GBPUSD': 0.00015,
+    'AUDUSD': 0.00015, 'USDCAD': 0.00018, 'USDCHF': 0.00018, 'NZDUSD': 0.00020,
+    'EURGBP': 0.00020, 'EURJPY': 0.00022, 'GBPJPY': 0.00028,
+    'AUDJPY': 0.00025, 'CADJPY': 0.00025, 'CHFJPY': 0.00025,
+    'EURAUD': 0.00030, 'EURCAD': 0.00030, 'GBPAUD': 0.00035, 'GBPCAD': 0.00035,
+    'AUDNZD': 0.00035, 'AUDCAD': 0.00030,
+    'USDMXN': 0.00100, 'USDZAR': 0.00120, 'USDTRY': 0.00200,
+    'USDSGD': 0.00030, 'USDCNH': 0.00040, 'USDSEK': 0.00040, 'USDNOK': 0.00040,
+    'EURTRY': 0.00250, 'EURZAR': 0.00150,
+    'NZDJPY': 0.00025,
+}
+DEFAULT_SPREAD = 0.00050   # fallback pour paires non listées
+
+
+def get_spread(pair: str) -> float:
+    """Retourne le spread spécifique ou le défaut."""
+    return SPECIFIC_SPREADS.get(pair, DEFAULT_SPREAD)
+
+
+def get_spread_cost(pair: str, price: float) -> float:
+    """Coût de transaction en % du prix (spread / prix moyen)."""
+    return get_spread(pair) / max(price, 0.01)
+
+
+# ── Features ML par horizon ──
+FEATURE_COLS_CT = [
+    "Return_1d", "Return_5d", "RSI", "ATR_14", "Bollinger_Pct",
+    "RealizedVol_21d", "Return_Clean_1d", "Return_Clean_5d",
+    "Shannon_Entropy", "Renyi_Entropy", "Hurst", "Hurst_Prediction",
+    "Momentum_CS",
+]
+
+FEATURE_COLS_MT = [
+    "Return_1d", "Return_5d", "Return_21d",
+    "SMA_21", "SMA_63", "MACD", "RSI", "ATR_14", "Bollinger_Pct",
+    "RealizedVol_21d", "RealizedVol_63d",
+    "Return_Clean_1d", "Return_Clean_5d", "MACD_Clean",
+    "Shannon_Entropy", "Renyi_Entropy",
+    "Hurst", "Fractal_Dimension", "Hurst_Prediction",
+    "Momentum_CS", "Momentum_3m",
+]
+
+# ── ML params ──
+LSTM_LOOKBACK = 40
+
+# ── Profils utilisateur ──
+PROFILES = {
+    'conservateur': {
+        'target_vol': 0.05, 'max_leverage': 1.0, 'risk_aversion': 4.0,
+        'max_drawdown': 0.08, 'max_weight': 0.20,
+        'horizon_weights': {'ct': 0.35, 'mt': 0.65},
+        'ct_model_weights': {'ridge': 0.70, 'lgbm': 0.30},
+        'mt_model_weights': {'gb': 0.70, 'transformer': 0.30},
+        'wf_train_window': 756, 'wf_retrain_freq': 63,
+        'ct_rebal': 3, 'mt_rebal': 21,
+    },
+    'equilibre': {
+        'target_vol': 0.10, 'max_leverage': 1.5, 'risk_aversion': 2.5,
+        'max_drawdown': 0.15, 'max_weight': 0.25,
+        'horizon_weights': {'ct': 0.45, 'mt': 0.55},
+        'ct_model_weights': {'ridge': 0.40, 'lgbm': 0.60},
+        'mt_model_weights': {'gb': 0.45, 'transformer': 0.55},
+        'wf_train_window': 756, 'wf_retrain_freq': 63,
+        'ct_rebal': 2, 'mt_rebal': 10,
+    },
+    'agressif': {
+        'target_vol': 0.18, 'max_leverage': 2.0, 'risk_aversion': 1.5,
+        'max_drawdown': 0.25, 'max_weight': 0.30,
+        'horizon_weights': {'ct': 0.55, 'mt': 0.45},
+        'ct_model_weights': {'ridge': 0.20, 'lgbm': 0.80},
+        'mt_model_weights': {'gb': 0.35, 'transformer': 0.65},
+        'wf_train_window': 756, 'wf_retrain_freq': 42,
+        'ct_rebal': 2, 'mt_rebal': 5,
+    },
+}
+
+
+@dataclass
+class UserConfig:
+    profile: str = 'equilibre'
+
+    # Rempli par set_profile()
+    target_vol: float = 0.10
+    max_leverage: float = 1.5
+    risk_aversion: float = 2.5
+    max_drawdown: float = 0.15
+    max_weight: float = 0.25
+    horizon_weights: dict = field(default_factory=lambda: {'ct': 0.45, 'mt': 0.55})
+    ct_model_weights: dict = field(default_factory=lambda: {'ridge': 0.40, 'lgbm': 0.60})
+    mt_model_weights: dict = field(default_factory=lambda: {'gb': 0.45, 'transformer': 0.55})
+    wf_train_window: int = 756
+    wf_retrain_freq: int = 63
+    ct_rebal: int = 2
+    mt_rebal: int = 10
+
+    # Wavelet
+    wavelet_name: str = "db4"
+    wavelet_level: int = 4
+    wavelet_method: str = "sure"
+
+    # Paires sélectionnées (None = toutes)
+    selected_pairs: Optional[List[str]] = None
+
+    # HMM / Hurst / GARCH
+    use_hurst: bool = True
+    hmm_n_states: int = 2
+    use_garch: bool = True
+
+    def set_profile(self, name: str):
+        p = PROFILES.get(name, PROFILES['equilibre'])
+        self.profile = name
+        for k, v in p.items():
+            setattr(self, k, v)
+
+    def summary(self) -> str:
+        hw = self.horizon_weights
+        return (
+            f"  Profil          : {self.profile}\n"
+            f"  Vol cible       : {self.target_vol:.0%}\n"
+            f"  Levier max      : {self.max_leverage:.1f}x\n"
+            f"  DD max          : {self.max_drawdown:.0%}\n"
+            f"  Horizons        : CT={hw['ct']:.0%}  MT={hw['mt']:.0%}\n"
+            f"  CT models       : Ridge={self.ct_model_weights['ridge']:.0%}  "
+            f"LGBM={self.ct_model_weights['lgbm']:.0%}\n"
+            f"  MT models       : GB={self.mt_model_weights['gb']:.0%}  "
+            f"Trans={self.mt_model_weights['transformer']:.0%}\n"
+            f"  Walk-forward    : {self.wf_train_window}j train, retrain/{self.wf_retrain_freq}j\n"
+            f"  Rebal           : CT/{self.ct_rebal}j  MT/{self.mt_rebal}j"
+        )
+
+
+USER = UserConfig()
+
+
+# ── Display helpers ──
+def hdr(title: str):
+    print(f"\n{'='*80}\n  {title}\n{'='*80}")
+
+def sub(title: str):
+    print(f"\n  ── {title} ──")
+
+def tbl(headers: list, rows: list):
+    cw = []
+    for i, h in enumerate(headers):
+        mx = len(str(h))
+        for r in rows:
+            mx = max(mx, len(str(r[i])))
+        cw.append(mx + 2)
+    sep = "+" + "+".join("-" * w for w in cw) + "+"
+    fmt = lambda v: "|" + "|".join(str(x).center(w) for x, w in zip(v, cw)) + "|"
+    print(sep); print(fmt(headers)); print(sep)
+    for r in rows:
+        print(fmt(r))
+    print(sep)
+
+
+# ── Graphiques ──
+plt.rcParams.update({
+    'figure.facecolor': '#0a0a0a', 'axes.facecolor': '#0f0f0f',
+    'axes.edgecolor': '#333', 'axes.labelcolor': '#ccc',
+    'text.color': '#ccc', 'xtick.color': '#999', 'ytick.color': '#999',
+    'grid.color': '#1a1a1a', 'font.family': 'monospace', 'font.size': 9,
+})
+C = {
+    'primary': '#00d4ff', 'secondary': '#00ff88', 'accent': '#ff6b35',
+    'warning': '#ffd700', 'danger': '#ff3366', 'purple': '#a855f7',
+    'bg': '#0a0a0a', 'text': '#ccc', 'dim': '#666',
+}
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  2. DATA                                                                      ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+def parse_pair(ticker: str) -> Tuple[str, str]:
+    t = ticker.replace("=X", "")
+    return t[:3], t[3:6]
+
+
+def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    prices = pd.read_csv(FILE_PRICES, index_col=0, parse_dates=True).sort_index()
+    rates  = pd.read_csv(FILE_RATES,  index_col=0, parse_dates=True).sort_index()
+    start  = max(prices.index.min(), rates.index.min())
+    end    = min(prices.index.max(), rates.index.max())
+    return prices.loc[start:end].ffill(), rates.loc[start:end].ffill()
+
+
+def get_fx_universe(prices: pd.DataFrame, rates: pd.DataFrame) -> List[str]:
+    rate_ccys = set(rates.columns)
+    valid = []
+    for ticker in prices.columns:
+        if not ticker.endswith("=X"):
+            continue
+        base, quote = parse_pair(ticker)
+        if base in rate_ccys and quote in rate_ccys:
+            pair = TICKER_TO_PAIR.get(ticker, "")
+            if USER.selected_pairs is not None and pair not in USER.selected_pairs:
+                continue
+            valid.append(ticker)
+    return valid
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    ret = prices.pct_change().replace([np.inf, -np.inf], np.nan)
+    return ret.dropna(how="all").dropna(axis=0, how="any")
+
+
+def compute_carry(pairs: List[str], rates: pd.DataFrame) -> pd.DataFrame:
+    carry = pd.DataFrame(index=rates.index)
+    for t in pairs:
+        base, quote = parse_pair(t)
+        carry[t] = (rates[base] - rates[quote]) / TRADING_DAYS
+    return carry
+
+
+def ticker_to_pair(ticker: str) -> str:
+    return TICKER_TO_PAIR.get(ticker, ticker.replace("=X", ""))
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  3. SIGNAL PROCESSING                                                         ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+# ── Wavelet SureShrink (Donoho & Johnstone 1995) ──
+
+def wavelet_denoise(signal: np.ndarray) -> np.ndarray:
+    coeffs = pywt.wavedec(signal, USER.wavelet_name, level=USER.wavelet_level)
+    coeffs_t = [coeffs[0]]
+    for c in coeffs[1:]:
+        sigma = np.median(np.abs(c)) / 0.6745
+        n = len(c)
+        if sigma < 1e-10 or n < 2:
+            coeffs_t.append(c); continue
+        c_norm = c / sigma
+        c2 = np.sort(c_norm ** 2)
+        risks = np.array([n - 2*(j+1) + np.sum(np.minimum(c2, c2[j])) for j in range(n)])
+        thr = sigma * np.sqrt(c2[np.argmin(risks)])
+        thr = min(thr, sigma * np.sqrt(2 * np.log(n)))
+        coeffs_t.append(pywt.threshold(c, thr, mode='soft'))
+    return pywt.waverec(coeffs_t, USER.wavelet_name)[:len(signal)]
+
+
+def apply_wavelet(data_dict: dict) -> dict:
+    hdr(f"WAVELET ({USER.wavelet_name}, {USER.wavelet_method.upper()})")
+    rows = []
+    for pair, df in data_dict.items():
+        raw = df['Close'].values
+        clean = wavelet_denoise(raw)
+        df['Close_Clean'] = clean
+        df['Return_Clean'] = pd.Series(clean, index=df.index).pct_change()
+        rows.append([pair, f"{np.std(raw-clean)/np.std(raw)*100:.1f}%"])
+    tbl(["Pair", "Bruit retiré"], rows)
+    return data_dict
+
+
+# ── Hurst + Garcin fBm prediction ──
+
+def estimate_hurst(returns: np.ndarray, max_lag: int = 50) -> float:
+    if len(returns) < 50:
+        return 0.5
+    try:
+        prices = np.cumsum(returns - np.mean(returns))
+        lags = np.unique(np.logspace(0, np.log10(max_lag), 15).astype(int))
+        lags = lags[lags < len(prices) // 2]
+        if len(lags) < 3:
+            return 0.5
+        log_m1, log_m2, log_tau = [], [], []
+        for tau in lags:
+            diffs = prices[tau:] - prices[:-tau]
+            if len(diffs) < 10:
+                continue
+            m1, m2 = np.mean(np.abs(diffs)), np.mean(diffs**2)
+            if m1 > 0 and m2 > 0:
+                log_m1.append(np.log(m1)); log_m2.append(np.log(m2))
+                log_tau.append(np.log(tau))
+        if len(log_m1) < 3:
+            return 0.5
+        X = np.array(log_tau).reshape(-1, 1)
+        H1 = LinearRegression().fit(X, np.array(log_m1)).coef_[0]
+        H2 = LinearRegression().fit(X, np.array(log_m2)).coef_[0] / 2
+        return np.clip(0.3 * H1 + 0.7 * H2, 0.2, 0.8)
+    except Exception:
+        return 0.5
+
+
+def predict_fbm_garcin(series: np.ndarray, H: float, horizon: int = 5) -> float:
+    try:
+        series = series[series > 0]
+        if len(series) < 50:
+            return 0.0
+        log_ret = np.diff(np.log(series))
+        if len(log_ret) < 20 or abs(H - 0.5) < 0.03:
+            return 0.0
+        n_past = min(50, len(log_ret))
+        recent = log_ret[-n_past:]
+        gamma = np.array([
+            0.5 * (abs(horizon+j+1)**(2*H) - 2*abs(horizon+j)**(2*H) + abs(horizon+j-1)**(2*H))
+            for j in range(n_past)
+        ])
+        Gamma = np.zeros((n_past, n_past))
+        for i in range(n_past):
+            for j in range(n_past):
+                k = abs(i - j)
+                Gamma[i, j] = 0.5 * (abs(k+1)**(2*H) - 2*abs(k)**(2*H) + abs(max(k-1, 0))**(2*H))
+        Gamma += 1e-8 * np.eye(n_past)
+        try:
+            w = np.linalg.solve(Gamma, gamma)
+        except np.linalg.LinAlgError:
+            w = np.linalg.lstsq(Gamma, gamma, rcond=None)[0]
+        return np.clip(float(np.dot(w, recent[::-1])) * 100, -3, 3)
+    except Exception:
+        return 0.0
+
+
+def apply_hurst(data_dict: dict) -> dict:
+    hdr("HURST + Garcin fBm")
+    rows = []
+    for pair, df in data_dict.items():
+        returns = df['Return_1d'].dropna()
+        df['Hurst'] = returns.rolling(252, min_periods=100).apply(
+            lambda x: estimate_hurst(x.values, 60), raw=False
+        )
+        df['Fractal_Dimension'] = 2 - df['Hurst']
+        df['Hurst_Prediction'] = np.nan
+        for i in range(252, len(df)):
+            if pd.notna(df['Hurst'].iloc[i]):
+                s = df['Close'].iloc[max(0, i-252):i].values
+                df.iloc[i, df.columns.get_loc('Hurst_Prediction')] = predict_fbm_garcin(
+                    s, df['Hurst'].iloc[i], horizon=5)
+        h = df['Hurst'].iloc[-1] if not df['Hurst'].isna().all() else 0.5
+        regime = "TREND" if h > 0.55 else ("MR" if h < 0.45 else "RW")
+        pred = df['Hurst_Prediction'].iloc[-1] if not df['Hurst_Prediction'].isna().all() else 0.0
+        rows.append([pair, f"{h:.3f}", regime, f"{pred:+.2f}%"])
+    tbl(["Pair", "H", "Type", "Pred 5j"], rows)
+    return data_dict
+
+
+# ── HMM Régimes (GMM fallback) ──
+
+def _fit_regime_single(returns_window: np.ndarray, n_states: int = 2) -> Tuple[int, float, float]:
+    """
+    Fit HMM/GMM sur une fenêtre passée et retourne (état du dernier jour, σ_low, σ_high).
+    Pas de look-ahead : on ne fit que sur les données de la fenêtre.
+    """
+    r = returns_window[np.isfinite(returns_window)]
+    if len(r) < 50:
+        return 0, 0.01, 0.02
+
+    # Essayer hmmlearn, sinon GMM
+    labels = None
+    try:
+        from hmmlearn import hmm as hmmlib
+        model = hmmlib.GaussianHMM(n_components=n_states,
+                                    covariance_type='diag', n_iter=100, random_state=42)
+        model.fit(r.reshape(-1, 1))
+        labels = model.predict(r.reshape(-1, 1))
+    except (ImportError, Exception):
+        pass
+
+    if labels is None:
+        gm = GaussianMixture(n_components=n_states, random_state=42, max_iter=200)
+        gm.fit(r.reshape(-1, 1))
+        labels = gm.predict(r.reshape(-1, 1))
+
+    # Align: état 0 = low-vol
+    vols = [r[labels == s].std() if (labels == s).any() else 0.01 for s in range(n_states)]
+    if vols[0] > vols[1]:
+        labels = 1 - labels
+        vols = [vols[1], vols[0]]
+
+    return int(labels[-1]), vols[0], vols[1]
+
+
+def apply_regimes(data_dict: dict, window: int = 252, step: int = 21) -> dict:
+    """
+    Régimes HMM/GMM en ROLLING — pas de look-ahead.
+
+    On fit le modèle sur une fenêtre glissante de 252 jours (1 an),
+    on refit tous les 21 jours (mensuel) pour ne pas être trop lent,
+    et entre 2 refits on garde le dernier état.
+    """
+    hdr(f"RÉGIMES HMM ROLLING (n={USER.hmm_n_states}, window={window}j, refit/{step}j)")
+    rmap = {0: "LOW-VOL", 1: "HIGH-VOL"}
+    rows = []
+
+    for pair, df in data_dict.items():
+        r = df['Return_1d'].values
+        n = len(r)
+        states = np.zeros(n, dtype=int)
+        last_sigma_low, last_sigma_high = 0.01, 0.02
+
+        # Avant d'avoir assez de données, on met LOW-VOL par défaut
+        last_state = 0
+
+        for t in range(n):
+            if t < window:
+                states[t] = 0  # pas assez de données, défaut LOW-VOL
+                continue
+
+            # Refit seulement tous les `step` jours (ou au premier point valide)
+            if t == window or (t - window) % step == 0:
+                r_window = r[t - window:t]  # que du passé, jamais t inclus
+                last_state, last_sigma_low, last_sigma_high = _fit_regime_single(
+                    r_window, USER.hmm_n_states)
+
+            states[t] = last_state
+
+        df['Regime_Code'] = states
+        df['Regime'] = pd.Series(states, index=df.index).map(rmap)
+        current = df['Regime'].iloc[-1] if not df['Regime'].isna().all() else "LOW-VOL"
+        rows.append([pair, current,
+                     f"{last_sigma_low*100:.2f}%", f"{last_sigma_high*100:.2f}%"])
+
+    tbl(["Pair", "Régime", "σ low", "σ high"], rows)
+    return data_dict
+
+
+# ── GARCH / EWMA vol forecast ──
+
+def apply_garch(data_dict: dict) -> dict:
+    if not USER.use_garch:
+        for df in data_dict.values():
+            df['GARCH_Vol'] = df['Return_1d'].rolling(21).std() * np.sqrt(252)
+        return data_dict
+
+    hdr("GARCH(1,1) / EWMA")
+    rows = []
+    for pair, df in data_dict.items():
+        r = df['Return_1d'].fillna(0).values
+
+        # Essayer arch, sinon EWMA
+        vol = None
+        try:
+            from arch import arch_model
+            am = arch_model(r * 100, vol='GARCH', p=1, q=1, rescale=False)
+            res = am.fit(disp='off', show_warning=False)
+            cv = res.conditional_volatility / 100
+            vol = np.full(len(r), np.nan)
+            vol[:len(cv)] = cv
+        except (ImportError, Exception):
+            pass
+
+        if vol is None:
+            # EWMA λ=0.94
+            var = np.zeros(len(r))
+            var[0] = np.var(r[:min(21, len(r))])
+            for t in range(1, len(r)):
+                var[t] = 0.94 * var[t-1] + 0.06 * r[t-1]**2
+            vol = np.sqrt(np.clip(var, 1e-10, None))
+
+        df['GARCH_Vol'] = pd.Series(vol * np.sqrt(252), index=df.index)
+        v = df['GARCH_Vol'].dropna().iloc[-1] if not df['GARCH_Vol'].isna().all() else 0
+        rows.append([pair, f"{v:.2%}"])
+    tbl(["Pair", "Vol ann."], rows)
+    return data_dict
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  4. FEATURES                                                                  ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+def _rsi(s: pd.Series, period: int = 14) -> pd.Series:
+    d = s.diff()
+    g = d.clip(lower=0).rolling(period).mean()
+    l = (-d.clip(upper=0)).rolling(period).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    c = df['Close']
+    return (c.pct_change().abs() * c).rolling(period).mean() / c
+
+
+def _boll_pct(c: pd.Series, w: int = 20) -> pd.Series:
+    ma = c.rolling(w).mean(); sd = c.rolling(w).std()
+    return (c - (ma - 2*sd)) / (4*sd + 1e-10)
+
+
+def _entropy(x, bins=50):
+    c, _ = np.histogram(x[np.isfinite(x)], bins=bins)
+    p = c / (c.sum() + 1e-10); p = p[p > 0]
+    return float(-np.sum(p * np.log2(p)))
+
+
+def _renyi(x, alpha=2.0, bins=50):
+    c, _ = np.histogram(x[np.isfinite(x)], bins=bins)
+    p = c / (c.sum() + 1e-10); p = p[p > 0]
+    return float((1/(1-alpha)) * np.log2(np.sum(p**alpha)))
+
+
+def _cross_sectional_momentum(data_dict: dict, lookback: int = 21) -> dict:
+    pairs = list(data_dict.keys())
+    if not pairs:
+        return data_dict
+    dates = data_dict[pairs[0]].index
+    mom = pd.DataFrame(index=dates, columns=pairs, dtype=float)
+    for p, df in data_dict.items():
+        mom[p] = df['Return_1d'].rolling(lookback).sum()
+    cs = mom.sub(mom.mean(axis=1), axis=0).div(mom.std(axis=1) + 1e-10, axis=0).clip(-3, 3)
+    for p in pairs:
+        data_dict[p]['Momentum_CS'] = cs[p]
+    return data_dict
+
+
+def create_features(data_dict: dict) -> dict:
+    hdr("FEATURES (CT + MT)")
+    for pair, df in data_dict.items():
+        c = df['Close']
+        clean = df.get('Close_Clean', c)
+        clean_s = pd.Series(clean, index=df.index) if not isinstance(clean, pd.Series) else clean
+
+        # Court terme
+        df['Return_1d']       = c.pct_change()
+        df['Return_5d']       = c.pct_change(5)
+        df['RSI']             = _rsi(c) / 100
+        df['ATR_14']          = _atr(df)
+        df['Bollinger_Pct']   = _boll_pct(c)
+        df['RealizedVol_21d'] = df['Return_1d'].rolling(21).std() * np.sqrt(252)
+
+        # Moyen terme
+        df['Return_21d']      = c.pct_change(21)
+        df['SMA_21']          = c / c.rolling(21).mean() - 1
+        df['SMA_63']          = c / c.rolling(63).mean() - 1
+        e12, e26              = c.ewm(span=12).mean(), c.ewm(span=26).mean()
+        df['MACD']            = (e12 - e26) / c
+        df['RealizedVol_63d'] = df['Return_1d'].rolling(63).std() * np.sqrt(252)
+        df['Momentum_3m']     = c.pct_change(63)
+
+        # Wavelet
+        df['Return_Clean_1d'] = clean_s.pct_change()
+        df['Return_Clean_5d'] = clean_s.pct_change(5)
+        e12c, e26c            = clean_s.ewm(span=12).mean(), clean_s.ewm(span=26).mean()
+        df['MACD_Clean']      = (e12c - e26c) / clean_s
+
+        # Entropie
+        df['Shannon_Entropy'] = df['Return_1d'].rolling(100).apply(_entropy, raw=True)
+        df['Renyi_Entropy']   = df['Return_1d'].rolling(100).apply(_renyi, raw=True)
+
+        # Placeholder CS
+        if 'Momentum_CS' not in df.columns:
+            df['Momentum_CS'] = 0.0
+
+        # Targets
+        df['Target_Dir_CT']  = (df['Return_1d'].shift(-1) > 0).astype(int)     # J+1
+        df['Target_Ret_CT']  = df['Return_1d'].shift(-1)
+        df['Target_Dir_MT']  = (df['Return_1d'].rolling(21).sum().shift(-21) > 0).astype(int)  # J+21
+        df['Target_Ret_MT']  = df['Return_1d'].rolling(21).sum().shift(-21)
+
+    data_dict = _cross_sectional_momentum(data_dict)
+    print(f"  CT: {len(FEATURE_COLS_CT)} features → target J+1")
+    print(f"  MT: {len(FEATURE_COLS_MT)} features → target J+21")
+    return data_dict
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  5. ML MODELS                                                                 ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+def create_sequences(X: np.ndarray, y: np.ndarray, lookback: int = LSTM_LOOKBACK):
+    Xs, ys = [], []
+    for i in range(lookback, len(X)):
+        Xs.append(X[i-lookback:i]); ys.append(y[i])
+    return np.array(Xs), np.array(ys)
+
+
+def _empty_result():
+    return {'accuracy': 0.5, 'prediction_series': pd.Series(dtype=float),
+            'expected_return_bps': 0}
+
+
+def _build_result(preds, probas, actuals, dates, ret_series):
+    preds, probas, actuals = np.array(preds), np.array(probas), np.array(actuals)
+    acc = accuracy_score(actuals, preds) if len(preds) else 0.5
+    ps  = pd.Series(probas, index=dates) if dates else pd.Series(dtype=float)
+    e_r = ret_series.reindex(dates).values if dates else np.array([0.0])
+    mask = preds == 1
+    pr = (np.nanmean(e_r[mask]) if mask.any() else 0) - (np.nanmean(e_r[~mask]) if (~mask).any() else 0)
+    return {'accuracy': acc, 'prediction_series': ps, 'expected_return_bps': pr * 10000}
+
+
+# ────────────────────────────────────────────────────
+# CT MODEL 1 : Ridge
+# ────────────────────────────────────────────────────
+
+def train_ridge_ct(data_dict: dict, pairs: list) -> dict:
+    sub("Ridge CT — Walk-Forward (J+1)")
+    results, rows = {}, []
+    for pair in pairs:
+        try:
+            df = data_dict[pair].dropna(subset=FEATURE_COLS_CT + ['Target_Dir_CT'])
+            oos = df.index.searchsorted(pd.Timestamp(BACKTEST_START))
+            if oos < 200 or oos >= len(df) - 50:
+                raise ValueError("data")
+            preds, probas, acts, dts = [], [], [], []
+            model, scaler = None, None
+            for t in range(oos, len(df)):
+                if model is None or (t - oos) % USER.wf_retrain_freq == 0:
+                    s = max(0, t - USER.wf_train_window)
+                    scaler = RobustScaler()
+                    X = scaler.fit_transform(df[FEATURE_COLS_CT].iloc[s:t].values.astype(np.float64))
+                    y = df['Target_Dir_CT'].iloc[s:t].values
+                    model = RidgeClassifier(alpha=1.0)
+                    model.fit(X, y)
+                xt = scaler.transform(df[FEATURE_COLS_CT].iloc[t:t+1].values.astype(np.float64))
+                score = float(model.decision_function(xt)[0])
+                p = np.clip(1/(1+np.exp(-score*0.5)), 0.01, 0.99)
+                probas.append(p); preds.append(int(p > 0.5))
+                acts.append(df['Target_Dir_CT'].iloc[t]); dts.append(df.index[t])
+            res = _build_result(preds, probas, acts, dts, df['Return_1d'])
+            results[pair] = res
+            rows.append([pair, f"{res['expected_return_bps']:+.1f}bps", f"{res['accuracy']:.1%}"])
+        except Exception as e:
+            results[pair] = _empty_result()
+            rows.append([pair, "0.0bps", "50.0%"])
+    tbl(["Pair", "E[r]", "Acc"], rows)
+    return results
+
+
+# ────────────────────────────────────────────────────
+# CT MODEL 2 : LightGBM (fallback sklearn GBM)
+# ────────────────────────────────────────────────────
+
+def _make_lgbm():
+    if HAS_LGBM:
+        return lgb.LGBMClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.02,
+            num_leaves=31, min_child_samples=15,
+            subsample=0.8, colsample_bytree=0.8,
+            random_state=42, verbose=-1, n_jobs=1)
+    return GradientBoostingClassifier(
+        n_estimators=150, max_depth=3, learning_rate=0.02,
+        min_samples_leaf=10, subsample=0.8, random_state=42)
+
+
+def train_lgbm_ct(data_dict: dict, pairs: list) -> dict:
+    sub("LightGBM CT — Walk-Forward (J+1)")
+    results, rows = {}, []
+    for pair in pairs:
+        try:
+            df = data_dict[pair].dropna(subset=FEATURE_COLS_CT + ['Target_Dir_CT'])
+            oos = df.index.searchsorted(pd.Timestamp(BACKTEST_START))
+            if oos < 200 or oos >= len(df) - 50:
+                raise ValueError("data")
+            preds, probas, acts, dts = [], [], [], []
+            model, scaler = None, None
+            for t in range(oos, len(df)):
+                if model is None or (t - oos) % USER.wf_retrain_freq == 0:
+                    s = max(0, t - USER.wf_train_window)
+                    scaler = RobustScaler()
+                    X = scaler.fit_transform(df[FEATURE_COLS_CT].iloc[s:t].values.astype(np.float64))
+                    y = df['Target_Dir_CT'].iloc[s:t].values
+                    model = _make_lgbm()
+                    model.fit(X, y)
+                xt = scaler.transform(df[FEATURE_COLS_CT].iloc[t:t+1].values.astype(np.float64))
+                p = float(model.predict_proba(xt)[0][1])
+                # Filtre Hurst: atténuer en régime trending
+                if 'Hurst' in df.columns:
+                    h = df['Hurst'].iloc[t]
+                    if pd.notna(h) and h > 0.55:
+                        p = 0.5 + (p - 0.5) * 0.3
+                probas.append(p); preds.append(int(p > 0.5))
+                acts.append(df['Target_Dir_CT'].iloc[t]); dts.append(df.index[t])
+            res = _build_result(preds, probas, acts, dts, df['Return_1d'])
+            results[pair] = res
+            rows.append([pair, f"{res['expected_return_bps']:+.1f}bps", f"{res['accuracy']:.1%}"])
+        except Exception as e:
+            results[pair] = _empty_result()
+            rows.append([pair, "0.0bps", "50.0%"])
+    tbl(["Pair", "E[r]", "Acc"], rows)
+    return results
+
+
+# ────────────────────────────────────────────────────
+# MT MODEL 1 : Gradient Boosting (21j)
+# ────────────────────────────────────────────────────
+
+def train_gb_mt(data_dict: dict, pairs: list) -> dict:
+    sub("Gradient Boosting MT — Walk-Forward (J+21)")
+    results, rows = {}, []
+    for pair in pairs:
+        try:
+            df = data_dict[pair].dropna(subset=FEATURE_COLS_MT + ['Target_Dir_MT'])
+            oos = df.index.searchsorted(pd.Timestamp(BACKTEST_START))
+            if oos < 252 or oos >= len(df) - 63:
+                raise ValueError("data")
+            preds, probas, acts, dts = [], [], [], []
+            model, scaler = None, None
+            for t in range(oos, len(df)):
+                if model is None or (t - oos) % USER.wf_retrain_freq == 0:
+                    s = max(0, t - USER.wf_train_window)
+                    scaler = StandardScaler()
+                    X = scaler.fit_transform(df[FEATURE_COLS_MT].iloc[s:t].values.astype(np.float64))
+                    y = df['Target_Dir_MT'].iloc[s:t].values
+                    model = GradientBoostingClassifier(
+                        n_estimators=150, max_depth=4, learning_rate=0.02,
+                        min_samples_leaf=20, subsample=0.8, random_state=42)
+                    model.fit(X, y)
+                xt = scaler.transform(df[FEATURE_COLS_MT].iloc[t:t+1].values.astype(np.float64))
+                p = float(model.predict_proba(xt)[0][1])
+                probas.append(p); preds.append(int(p > 0.5))
+                acts.append(df['Target_Dir_MT'].iloc[t]); dts.append(df.index[t])
+            res = _build_result(preds, probas, acts, dts,
+                                df['Return_21d'] if 'Return_21d' in df else df['Return_1d'])
+            results[pair] = res
+            rows.append([pair, f"{res['expected_return_bps']:+.1f}bps", f"{res['accuracy']:.1%}"])
+        except Exception as e:
+            results[pair] = _empty_result()
+            rows.append([pair, "0.0bps", "50.0%"])
+    tbl(["Pair", "E[r] 21j", "Acc"], rows)
+    return results
+
+
+# ────────────────────────────────────────────────────
+# MT MODEL 2 : Transformer (21j)
+# ────────────────────────────────────────────────────
+
+class _PosEnc(nn.Module if HAS_TORCH else object):
+    def __init__(self, d, dropout=0.1, max_len=500):
+        if not HAS_TORCH: return
+        super().__init__()
+        self.drop = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d)
+        pos = torch.arange(0, max_len).float().unsqueeze(1)
+        div = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000.0)/d))
+        pe[:, 0::2] = torch.sin(pos * div); pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return self.drop(x + self.pe[:, :x.size(1)])
+
+
+class FXTransformer(nn.Module if HAS_TORCH else object):
+    def __init__(self, n_feat, d=64, nhead=4, nlayers=2, dff=128, drop=0.1):
+        if not HAS_TORCH: return
+        super().__init__()
+        self.proj = nn.Linear(n_feat, d)
+        self.pe   = _PosEnc(d, drop)
+        layer = nn.TransformerEncoderLayer(d_model=d, nhead=nhead,
+                dim_feedforward=dff, dropout=drop, batch_first=True)
+        self.enc  = nn.TransformerEncoder(layer, num_layers=nlayers)
+        self.head = nn.Sequential(nn.Linear(d, 32), nn.ReLU(),
+                                  nn.Dropout(drop), nn.Linear(32, 1), nn.Sigmoid())
+
+    def forward(self, x):
+        return self.head(self.enc(self.pe(self.proj(x))).mean(dim=1)).squeeze(-1)
+
+
+def train_transformer_mt(data_dict: dict, pairs: list) -> dict:
+    sub("Transformer MT — Walk-Forward (J+21)")
+    if not HAS_TORCH:
+        print("  [WARN] PyTorch absent → fallback GB")
+        return train_gb_mt(data_dict, pairs)
+
+    device = torch.device('cpu')
+    results, rows = {}, []
+    for pair in pairs:
+        try:
+            df = data_dict[pair].dropna(subset=FEATURE_COLS_MT + ['Target_Dir_MT'])
+            oos = df.index.searchsorted(pd.Timestamp(BACKTEST_START))
+            if oos < LSTM_LOOKBACK + 252:
+                raise ValueError("data")
+            preds, probas, acts, dts = [], [], [], []
+            model, scaler = None, None
+            retrain = 126   # semestriel (lourd)
+            for t in range(oos, len(df)):
+                if model is None or (t - oos) % retrain == 0:
+                    s = max(0, t - USER.wf_train_window)
+                    scaler = StandardScaler()
+                    Xr = scaler.fit_transform(df[FEATURE_COLS_MT].iloc[s:t].values.astype(np.float64))
+                    yr = df['Target_Dir_MT'].iloc[s:t].values
+                    Xs, ys = create_sequences(Xr, yr)
+                    if len(Xs) < 100: continue
+                    Xt = torch.FloatTensor(Xs).to(device)
+                    yt = torch.FloatTensor(ys).to(device)
+                    dl = DataLoader(TensorDataset(Xt, yt), batch_size=32, shuffle=True)
+                    model = FXTransformer(len(FEATURE_COLS_MT)).to(device)
+                    opt = torch.optim.Adam(model.parameters(), lr=0.001)
+                    loss_fn = nn.BCELoss()
+                    best, pat = float('inf'), 0
+                    for ep in range(20):
+                        model.train(); el = 0
+                        for xb, yb in dl:
+                            opt.zero_grad(); l = loss_fn(model(xb), yb)
+                            l.backward(); opt.step(); el += l.item()
+                        avg = el / len(dl)
+                        if avg < best - 1e-4: best, pat = avg, 0
+                        else:
+                            pat += 1
+                            if pat >= 5: break
+                if model is None or scaler is None: continue
+                lb = df[FEATURE_COLS_MT].iloc[t-LSTM_LOOKBACK:t].values.astype(np.float64)
+                xi = torch.FloatTensor(scaler.transform(lb)).unsqueeze(0).to(device)
+                model.eval()
+                with torch.no_grad():
+                    p = float(model(xi).cpu().item())
+                probas.append(p); preds.append(int(p > 0.5))
+                acts.append(df['Target_Dir_MT'].iloc[t]); dts.append(df.index[t])
+            res = _build_result(preds, probas, acts, dts,
+                                df['Return_21d'] if 'Return_21d' in df else df['Return_1d'])
+            results[pair] = res
+            rows.append([pair, f"{res['expected_return_bps']:+.1f}bps", f"{res['accuracy']:.1%}"])
+            del model; gc.collect()
+        except Exception as e:
+            results[pair] = _empty_result()
+            rows.append([pair, "0.0bps", "50.0%"])
+    tbl(["Pair", "E[r] 21j", "Acc"], rows)
+    gc.collect()
+    return results
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  6. STRATEGIES                                                                ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+@dataclass
+class StrategyResult:
+    name: str
+    daily_returns: pd.Series
+    description: str = ""
+    sharpe: float = 0.0
+    sortino: float = 0.0
+    calmar: float = 0.0
+    max_dd: float = 0.0
+    cagr: float = 0.0
+    ann_vol: float = 0.0
+    win_rate: float = 0.0
+    total_return: float = 0.0
+
+    def compute(self):
+        r = self.daily_returns.dropna()
+        if len(r) < 10: return self
+        nav = (1 + r).cumprod(); n = len(r)
+        self.cagr = float(nav.iloc[-1] ** (TRADING_DAYS/n) - 1)
+        self.total_return = float(nav.iloc[-1] - 1)
+        self.ann_vol = float(r.std() * np.sqrt(TRADING_DAYS))
+        self.sharpe = float(r.mean() / r.std() * np.sqrt(TRADING_DAYS)) if r.std() > 0 else 0
+        dn = r[r < 0].std()
+        self.sortino = float(r.mean() / dn * np.sqrt(TRADING_DAYS)) if dn > 0 else 0
+        dd = nav / nav.cummax() - 1
+        self.max_dd = float(dd.min())
+        self.calmar = float(self.cagr / abs(self.max_dd)) if self.max_dd != 0 else 0
+        self.win_rate = float((r > 0).mean())
+        return self
+
+
+def _get_signal(res: dict, dt, default=0.5) -> float:
+    s = res.get('prediction_series', pd.Series(dtype=float))
+    if isinstance(s, pd.Series) and len(s) > 0:
+        past = s.loc[:dt]
+        if len(past) > 0:
+            return float(past.iloc[-1])
+    return default
+
+
+def _vol_scale(w, cov, target_vol, max_lev):
+    v = np.sqrt(max(float(w.T @ cov @ w), 0)) * np.sqrt(TRADING_DAYS)
+    if v > 1e-10:
+        w = w * min(target_vol / v, max_lev)
+    return w
+
+
+def _spread_cost_for_pair(pair: str, data_dict: dict, dt) -> float:
+    """Retourne le coût de spread en % pour un aller-retour sur cette paire."""
+    spread = get_spread(pair)
+    df = data_dict.get(pair)
+    if df is not None and dt in df.index:
+        price = df.loc[dt, 'Close']
+        return spread / max(price, 0.001)
+    # Fallback : spread brut (OK pour paires cotées ~1.xx comme EURUSD)
+    return spread
+
+
+# ── Benchmark 1/N ──
+
+def strategy_equal_weight(ret: pd.DataFrame) -> StrategyResult:
+    return StrategyResult(
+        name="0. Equal Weight (1/N)",
+        daily_returns=ret.mean(axis=1),
+        description="Benchmark naïf"
+    ).compute()
+
+
+# ── COURT TERME ──
+
+def strategy_ct(ret: pd.DataFrame, data_dict: dict,
+                ridge_res: dict, lgbm_res: dict) -> StrategyResult:
+    """
+    CT : blend Ridge + LightGBM selon profil.
+    Spread déduit à chaque rebalancement.
+    """
+    w_ridge = USER.ct_model_weights['ridge']
+    w_lgbm  = USER.ct_model_weights['lgbm']
+
+    assets = ret.columns.tolist()
+    n      = len(assets)
+    dates  = ret.loc[BACKTEST_START:].index
+    rebal  = USER.ct_rebal
+
+    port_ret = pd.Series(0.0, index=dates, dtype=float)
+    w_prev   = np.zeros(n)
+
+    for t_idx, dt in enumerate(dates):
+        loc = ret.index.get_loc(dt)
+        port_ret.loc[dt] = float(w_prev @ ret.iloc[loc].values)
+
+        if t_idx % rebal != 0:
+            continue
+
+        w_new = np.zeros(n)
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            if pair not in data_dict: continue
+            df = data_dict[pair]
+            if len(df.loc[:dt]) < 63: continue
+
+            # Blend des 2 modèles CT
+            p_ridge = _get_signal(ridge_res.get(pair, {}), dt)
+            p_lgbm  = _get_signal(lgbm_res.get(pair, {}), dt)
+            blended = w_ridge * (p_ridge - 0.5) * 2 + w_lgbm * (p_lgbm - 0.5) * 2
+
+            # Modulation HMM
+            if 'Regime' in df.columns:
+                reg = df['Regime'].loc[:dt].dropna()
+                if len(reg) > 0:
+                    boost = {"LOW-VOL": 1.1, "HIGH-VOL": 0.75}.get(reg.iloc[-1], 1.0)
+                    blended *= boost
+
+            w_new[i] = np.tanh(blended * 1.5)
+
+        # Contrainte levier
+        gross = np.sum(np.abs(w_new))
+        if gross > USER.max_leverage * 0.5:
+            w_new *= USER.max_leverage * 0.5 / gross
+
+        # Coût de spread réel par paire (proportionnel au turnover)
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            turnover_i = abs(w_new[i] - w_prev[i])
+            if turnover_i > 0.01:
+                cost = _spread_cost_for_pair(pair, data_dict, dt)
+                port_ret.loc[dt] -= turnover_i * cost
+
+        w_prev = w_new
+
+    return StrategyResult(
+        name=f"1. Court Terme (Ridge {w_ridge:.0%} + LGBM {w_lgbm:.0%})",
+        daily_returns=port_ret.dropna(),
+        description=f"CT blend, rebal/{rebal}j, spreads réels"
+    ).compute()
+
+
+# ── MOYEN TERME ──
+
+def strategy_mt(ret: pd.DataFrame, data_dict: dict,
+                gb_res: dict, trans_res: dict) -> StrategyResult:
+    """
+    MT : blend GB + Transformer selon profil.
+    Spread déduit à chaque rebalancement.
+    """
+    w_gb   = USER.mt_model_weights['gb']
+    w_tr   = USER.mt_model_weights['transformer']
+
+    assets = ret.columns.tolist()
+    n      = len(assets)
+    dates  = ret.loc[BACKTEST_START:].index
+    rebal  = USER.mt_rebal
+
+    port_ret = pd.Series(0.0, index=dates, dtype=float)
+    w_prev   = np.zeros(n)
+
+    for t_idx, dt in enumerate(dates):
+        loc = ret.index.get_loc(dt)
+        port_ret.loc[dt] = float(w_prev @ ret.iloc[loc].values)
+
+        if t_idx % rebal != 0:
+            continue
+
+        w_new = np.zeros(n)
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            if pair not in data_dict: continue
+
+            p_gb = _get_signal(gb_res.get(pair, {}), dt)
+            p_tr = _get_signal(trans_res.get(pair, {}), dt)
+            blended = w_gb * (p_gb - 0.5) * 2 + w_tr * (p_tr - 0.5) * 2
+
+            # Modulation HMM
+            df = data_dict[pair]
+            if 'Regime' in df.columns:
+                reg = df['Regime'].loc[:dt].dropna()
+                if len(reg) > 0:
+                    boost = {"LOW-VOL": 1.15, "HIGH-VOL": 0.80}.get(reg.iloc[-1], 1.0)
+                    blended *= boost
+
+            w_new[i] = np.tanh(blended * 1.5)
+
+        # Contrainte levier
+        gross = np.sum(np.abs(w_new))
+        max_lev = USER.max_leverage * 0.7
+        if gross > max_lev:
+            w_new *= max_lev / gross
+        w_new[np.abs(w_new) < 0.01] = 0.0
+
+        # Vol targeting si assez de données
+        if loc >= 252:
+            window = ret.iloc[max(0, loc-252):loc]
+            cov = window.cov().values + 1e-6 * np.eye(n)
+            w_new = _vol_scale(w_new, cov, USER.target_vol * 0.7, max_lev)
+            w_new = np.clip(w_new, -USER.max_weight, USER.max_weight)
+
+        # Coût spread réel
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            turnover_i = abs(w_new[i] - w_prev[i])
+            if turnover_i > 0.01:
+                cost = _spread_cost_for_pair(pair, data_dict, dt)
+                port_ret.loc[dt] -= turnover_i * cost
+
+        w_prev = w_new
+
+    return StrategyResult(
+        name=f"2. Moyen Terme (GB {w_gb:.0%} + Trans {w_tr:.0%})",
+        daily_returns=port_ret.dropna(),
+        description=f"MT blend, rebal/{rebal}j, vol target, spreads réels"
+    ).compute()
+
+
+# ── COMBINÉ CT + MT ──
+
+def strategy_combined(ret: pd.DataFrame, data_dict: dict,
+                      ridge_res: dict, lgbm_res: dict,
+                      gb_res: dict, trans_res: dict) -> StrategyResult:
+    """
+    Combiné : fusion CT + MT pondérée par horizon_weights.
+    Spread réel déduit par paire.
+    """
+    hw = USER.horizon_weights
+
+    assets = ret.columns.tolist()
+    n      = len(assets)
+    dates  = ret.loc[BACKTEST_START:].index
+
+    port_ret = pd.Series(0.0, index=dates, dtype=float)
+    w_prev   = np.zeros(n)
+
+    for t_idx, dt in enumerate(dates):
+        loc = ret.index.get_loc(dt)
+        port_ret.loc[dt] = float(w_prev @ ret.iloc[loc].values)
+
+        if t_idx % 5 != 0 or loc < 252:
+            continue
+
+        signals = np.zeros(n)
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            if pair not in data_dict: continue
+
+            # CT signal (blend Ridge + LGBM)
+            p_ridge = _get_signal(ridge_res.get(pair, {}), dt)
+            p_lgbm  = _get_signal(lgbm_res.get(pair, {}), dt)
+            ct_sig  = (USER.ct_model_weights['ridge'] * (p_ridge - 0.5) * 2 +
+                       USER.ct_model_weights['lgbm']  * (p_lgbm  - 0.5) * 2)
+
+            # MT signal (blend GB + Transformer)
+            p_gb = _get_signal(gb_res.get(pair, {}), dt)
+            p_tr = _get_signal(trans_res.get(pair, {}), dt)
+            mt_sig = (USER.mt_model_weights['gb']          * (p_gb - 0.5) * 2 +
+                      USER.mt_model_weights['transformer'] * (p_tr - 0.5) * 2)
+
+            # Modulation régime
+            df = data_dict[pair]
+            if 'Regime' in df.columns:
+                reg = df['Regime'].loc[:dt].dropna()
+                if len(reg) > 0:
+                    boost = {"LOW-VOL": 1.1, "HIGH-VOL": 0.80}.get(reg.iloc[-1], 1.0)
+                    ct_sig *= boost; mt_sig *= boost
+
+            signals[i] = hw['ct'] * ct_sig + hw['mt'] * mt_sig
+
+        w_new = np.tanh(signals * 1.5)
+
+        # Vol targeting
+        window = ret.iloc[max(0, loc-252):loc]
+        cov = window.cov().values + 1e-6 * np.eye(n)
+        w_new = _vol_scale(w_new, cov, USER.target_vol, USER.max_leverage)
+        w_new = np.clip(w_new, -USER.max_weight, USER.max_weight)
+
+        # Spread réel
+        for i, a in enumerate(assets):
+            pair = ticker_to_pair(a)
+            turnover_i = abs(w_new[i] - w_prev[i])
+            if turnover_i > 0.01:
+                cost = _spread_cost_for_pair(pair, data_dict, dt)
+                port_ret.loc[dt] -= turnover_i * cost
+
+        w_prev = w_new
+
+    return StrategyResult(
+        name=f"3. Combiné (CT {hw['ct']:.0%} + MT {hw['mt']:.0%})",
+        daily_returns=port_ret.dropna(),
+        description=f"Combiné CT+MT, vol target {USER.target_vol:.0%}, spreads réels"
+    ).compute()
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  7. BACKTEST — métriques, comparaison, plots                                  ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+def print_comparison(results: List[StrategyResult]):
+    hdr("COMPARAISON")
+    headers = ["#", "Stratégie", "Sharpe", "Sortino", "Calmar",
+               "MaxDD", "CAGR", "Vol", "Win%"]
+    rows = []
+    for i, r in enumerate(results):
+        rows.append([str(i), r.name, f"{r.sharpe:.3f}", f"{r.sortino:.3f}",
+                     f"{r.calmar:.3f}", f"{r.max_dd:.2%}", f"{r.cagr:.2%}",
+                     f"{r.ann_vol:.2%}", f"{r.win_rate:.1%}"])
+    tbl(headers, rows)
+
+
+def summary_df(results: List[StrategyResult]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        'Strategy': r.name, 'Sharpe': r.sharpe, 'Sortino': r.sortino,
+        'CAGR': r.cagr, 'MaxDD': r.max_dd, 'Calmar': r.calmar,
+        'AnnVol': r.ann_vol, 'WinRate': r.win_rate, 'TotalReturn': r.total_return
+    } for r in results])
+
+
+def plot_equity(results: List[StrategyResult], filename="fig1_equity.png"):
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10), facecolor=C['bg'],
+                             gridspec_kw={'height_ratios': [3, 1]})
+    fig.suptitle("Performance OOS walk-forward", color=C['primary'], fontsize=14, fontweight='bold')
+    colors = [C['dim'], C['accent'], C['warning'], C['primary'], C['secondary']]
+    for i, r in enumerate(results):
+        nav = (1 + r.daily_returns).cumprod()
+        axes[0].plot(nav.index, nav, color=colors[i % len(colors)],
+                     lw=2.0 if i == len(results)-1 else 1.0, label=r.name)
+    axes[0].axhline(1, color=C['dim'], ls='--', lw=0.5)
+    axes[0].set_ylabel("NAV"); axes[0].legend(fontsize=8); axes[0].grid(True, alpha=0.2)
+    best = results[-1]
+    nav = (1 + best.daily_returns).cumprod()
+    axes[1].fill_between(nav.index, nav/nav.cummax()-1, alpha=0.4, color=C['danger'])
+    axes[1].set_ylabel(f"DD ({best.name})"); axes[1].grid(True, alpha=0.2)
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, filename), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  [OK] {filename}")
+
+
+def plot_comparison(results: List[StrategyResult], filename="fig2_comparison.png"):
+    fig, axes = plt.subplots(1, 4, figsize=(20, 6), facecolor=C['bg'])
+    fig.suptitle("Comparaison", color=C['primary'], fontsize=14)
+    names = [r.name.split('. ')[1] if '. ' in r.name else r.name for r in results]
+    x = np.arange(len(names))
+    cols = [C['dim'], C['accent'], C['warning'], C['primary'], C['secondary']]
+    for ax, vals, lab in [
+        (axes[0], [r.sharpe for r in results], "Sharpe"),
+        (axes[1], [r.cagr*100 for r in results], "CAGR (%)"),
+        (axes[2], [r.max_dd*100 for r in results], "Max DD (%)"),
+        (axes[3], [r.sortino for r in results], "Sortino"),
+    ]:
+        ax.bar(x, vals, color=[cols[i%len(cols)] for i in range(len(results))])
+        ax.set_title(lab, color=C['text'])
+        ax.set_xticks(x); ax.set_xticklabels(names, rotation=45, fontsize=7, ha='right')
+        ax.grid(True, alpha=0.2)
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, filename), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  [OK] {filename}")
+
+
+def plot_signals(data_dict: dict, filename="fig3_signals.png"):
+    pair = "EURUSD" if "EURUSD" in data_dict else list(data_dict.keys())[0]
+    df = data_dict[pair].tail(500)
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), facecolor=C['bg'])
+    fig.suptitle(f"Signaux — {pair}", color=C['primary'], fontsize=14)
+
+    axes[0].plot(df.index, df['Close'], color=C['dim'], alpha=0.5, lw=0.6, label='Raw')
+    if 'Close_Clean' in df:
+        axes[0].plot(df.index, df['Close_Clean'], color=C['primary'], lw=1.5, label='Wavelet')
+    axes[0].set_title("Prix + Wavelet", color=C['text']); axes[0].legend(fontsize=7)
+    axes[0].grid(True, alpha=0.2)
+
+    axes[1].plot(df.index, df['Close'], color=C['text'], lw=0.8)
+    if 'Regime' in df:
+        for reg, col in [("LOW-VOL", C['secondary']), ("HIGH-VOL", C['danger'])]:
+            mask = df['Regime'] == reg
+            if mask.any():
+                axes[1].fill_between(df.index, df['Close'].min(), df['Close'].max(),
+                                     where=mask, alpha=0.15, color=col, label=reg)
+    axes[1].set_title("Régimes HMM", color=C['text']); axes[1].legend(fontsize=7)
+    axes[1].grid(True, alpha=0.2)
+
+    if 'Hurst' in df:
+        h = df['Hurst'].dropna()
+        axes[2].plot(h.index, h, color=C['purple'], lw=1)
+        axes[2].axhline(0.5, color=C['danger'], ls='--', lw=0.8)
+        axes[2].set_ylim(0.2, 0.8)
+    axes[2].set_title("Hurst (Garcin)", color=C['text']); axes[2].grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUTPUT_DIR, filename), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  [OK] {filename}")
+
+
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  8. MAIN                                                                      ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
+
+def interactive_setup():
+    print("\n" + "="*80)
+    print("  FX FRAMEWORK v5 — CT + MT (spreads réels)")
+    print("="*80)
+
+    print("\n  [1/3] PROFIL")
+    print("    [1] Conservateur  — vol=5%,  levier=1x,  Ridge>LGBM, GB>Trans")
+    print("    [2] Equilibré     — vol=10%, levier=1.5x, LGBM>Ridge, Trans≈GB")
+    print("    [3] Agressif      — vol=18%, levier=2x,  LGBM>>Ridge, Trans>GB")
+    choice = input("\n  Choix (1-3) [2] : ").strip() or '2'
+    if choice == '1':
+        USER.set_profile('conservateur')
+    elif choice == '3':
+        USER.set_profile('agressif')
+    else:
+        USER.set_profile('equilibre')
+
+    print("\n  [2/3] PAIRES")
+    all_pairs = sorted(PAIR_MAP.keys())
+    for i, p in enumerate(all_pairs, 1):
+        spread_bps = get_spread(p) * 10000
+        print(f"    [{i:2d}] {p} ({spread_bps:.1f}bps)", end="   ")
+        if i % 4 == 0: print()
+    print()
+    sel = input("\n  Paires (ex: 1,2,5 ou ENTER=toutes) : ").strip()
+    if sel:
+        try:
+            indices = [int(x.strip())-1 for x in sel.split(',')]
+            USER.selected_pairs = [all_pairs[i] for i in indices if 0 <= i < len(all_pairs)]
+        except (ValueError, IndexError):
+            USER.selected_pairs = None
+    else:
+        USER.selected_pairs = None
+
+    print("\n  [3/3] CONFIRMATION")
+    print(USER.summary())
+    print()
+
+    # Afficher les spreads sélectionnés
+    selected = USER.selected_pairs or all_pairs
+    spread_rows = [[p, f"{get_spread(p)*10000:.1f} bps"] for p in selected]
+    tbl(["Pair", "Spread"], spread_rows)
+
+    confirm = input("\n  Confirmer ? (O/n) : ").strip().lower()
+    if confirm == 'n':
+        return interactive_setup()
+
+
+def main():
+    if '--default' in sys.argv:
+        USER.set_profile('equilibre')
+    else:
+        interactive_setup()
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # ── 1. DATA ──
+    hdr("CHARGEMENT")
+    prices, rates = load_data()
+    tickers = get_fx_universe(prices, rates)
+    pairs   = [ticker_to_pair(t) for t in tickers]
+    print(f"  Univers : {len(pairs)} paires")
+    ret   = compute_returns(prices[tickers])
+    carry = compute_carry(tickers, rates).loc[ret.index[0]:]
+    carry = carry.reindex(ret.index, method='ffill')
+
+    # ── 2. DATA_DICT ──
+    data_dict = {}
+    for t in tickers:
+        pair = ticker_to_pair(t)
+        df = pd.DataFrame({'Close': prices[t]}).dropna()
+        df['Return_1d'] = df['Close'].pct_change()
+        data_dict[pair] = df
+
+    # ── 3. SIGNAL ──
+    data_dict = apply_wavelet(data_dict)
+
+    # ── 4. FEATURES ──
+    data_dict = create_features(data_dict)
+
+    # ── 5. SIGNAL AVANCÉ ──
+    data_dict = apply_hurst(data_dict)
+    data_dict = apply_regimes(data_dict)
+    data_dict = apply_garch(data_dict)
+
+    # ── 6. ML ──
+    hdr(f"ML — 2 modèles CT + 2 modèles MT (walk-forward, retrain/{USER.wf_retrain_freq}j)")
+
+    ridge_res = train_ridge_ct(data_dict, pairs)
+    lgbm_res  = train_lgbm_ct(data_dict, pairs)
+    gb_res    = train_gb_mt(data_dict, pairs)
+    trans_res = train_transformer_mt(data_dict, pairs)
+
+    # ── 7. STRATEGIES ──
+    hdr(f"STRATEGIES ({BACKTEST_START} → aujourd'hui)")
+    results = []
+
+    s0 = strategy_equal_weight(ret.loc[BACKTEST_START:])
+    results.append(s0)
+    print(f"  [0] {s0.name}: Sharpe={s0.sharpe:.3f}  CAGR={s0.cagr:.2%}")
+
+    s1 = strategy_ct(ret, data_dict, ridge_res, lgbm_res)
+    results.append(s1)
+    print(f"  [1] {s1.name}: Sharpe={s1.sharpe:.3f}  CAGR={s1.cagr:.2%}")
+
+    s2 = strategy_mt(ret, data_dict, gb_res, trans_res)
+    results.append(s2)
+    print(f"  [2] {s2.name}: Sharpe={s2.sharpe:.3f}  CAGR={s2.cagr:.2%}")
+
+    s3 = strategy_combined(ret, data_dict, ridge_res, lgbm_res, gb_res, trans_res)
+    results.append(s3)
+    print(f"  [3] {s3.name}: Sharpe={s3.sharpe:.3f}  CAGR={s3.cagr:.2%}")
+
+    # ── 8. RÉSULTATS ──
+    print_comparison(results)
+    plot_equity(results)
+    plot_comparison(results)
+    plot_signals(data_dict)
+    summary_df(results).to_csv(os.path.join(OUTPUT_DIR, "strategy_comparison.csv"), index=False)
+
+    print("\n" + "="*80)
+    if len(results) > 1:
+        best = max(results[1:], key=lambda r: r.sharpe)
+        print(f"  Meilleure : {best.name} (Sharpe={best.sharpe:.3f}, CAGR={best.cagr:.2%})")
+    print(f"  Outputs   : {OUTPUT_DIR}/")
+    print("="*80)
+
+
+if __name__ == '__main__':
+    main()
