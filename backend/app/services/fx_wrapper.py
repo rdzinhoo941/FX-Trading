@@ -209,37 +209,135 @@ def run_quarterly_bl_allocation(
     risk_aversion: str,
 ) -> tuple[List[AllocationRow], KpiSummary]:
     """
-    Placeholder temporaire pour le modèle trimestriel B-L.
-    À remplacer dès que tu m’envoies le script/fonction exacte.
+    Wrapper API pour le script 'B-L momentum for assets and rates.py'.
+
+    On reconstruit les poids BL à la dernière date disponible,
+    puis on les convertit au format attendu par l'API.
     """
-    n = len(pairs)
-    if n == 0:
-        raise ValueError("Aucune paire fournie.")
+    repo_root = Path(__file__).resolve().parents[3]
+    bl_path = repo_root / "B-L momentum for assets and rates.py"
 
-    w = np.ones(n) / n
+    if not bl_path.exists():
+        raise FileNotFoundError(
+            f"B-L momentum for assets and rates.py introuvable: {bl_path}"
+        )
+
+    bl = _load_module_from_path("bl_momentum_runtime", bl_path)
+
+    # Chargement local des données depuis /data
+    prices = pd.read_csv(repo_root / "data" / "data_forex_prices.csv", index_col=0, parse_dates=True)
+    rates_daily = pd.read_csv(repo_root / "data" / "data_fred_rates.csv", index_col=0, parse_dates=True)
+
+    common_idx = prices.index.intersection(rates_daily.index)
+    prices = prices.loc[common_idx]
+    rates_daily = rates_daily.loc[common_idx]
+
+    prices = prices.loc["2015-01-01":]
+    rates_daily = rates_daily.loc["2015-01-01":]
+
+    # Restriction aux paires demandées par l'interface
+    requested_tickers = []
+    for pair in pairs:
+        ticker = f"{pair}=X"
+        if ticker in prices.columns:
+            requested_tickers.append(ticker)
+
+    if not requested_tickers:
+        raise ValueError("Aucune paire valide pour le modèle quarterly BL.")
+
+    prices = prices[requested_tickers]
+
+    # Recréation des returns_total et momentum_score comme dans le script BL
+    returns_total = pd.DataFrame(index=prices.index, columns=requested_tickers, dtype=float)
+    momentum_score = pd.DataFrame(index=prices.index, columns=requested_tickers, dtype=float)
+
+    for t in requested_tickers:
+        base, quote = bl.parse_pair(t)
+
+        r_price = prices[t].pct_change()
+
+        r_carry = 0.0
+        if base in rates_daily.columns and quote in rates_daily.columns:
+            raw_diff = rates_daily[base] - rates_daily[quote]
+            realistic_diff = raw_diff - bl.BROKER_SWAP_MARKUP
+            r_carry = realistic_diff / 252.0
+
+        returns_total[t] = r_price + r_carry
+
+        log_rets = np.log(1 + returns_total[t])
+        momentum_score[t] = log_rets.rolling(bl.LOOKBACK_MOMENTUM).sum().shift(1)
+
+    returns_total.dropna(inplace=True)
+    momentum_score.dropna(inplace=True)
+
+    start_bt = "2018-01-01"
+    returns_total = returns_total.loc[start_bt:]
+    momentum_score = momentum_score.loc[start_bt:]
+    prices = prices.loc[start_bt:]
+
+    if returns_total.empty or momentum_score.empty:
+        raise ValueError("Pas assez de données pour calculer les poids quarterly BL.")
+
+    # On injecte les objets globaux attendus par get_black_litterman_weights
+    bl.returns_total = returns_total
+    bl.momentum_score = momentum_score
+
+    # Ajustement simple selon le niveau de risque utilisateur
+    risk_map = {
+        "low": 1.5,
+        "medium": 2.5,
+        "high": 4.0,
+    }
+    bl.RISK_AVERSION_DELTA = risk_map.get((risk_aversion or "").lower(), 2.5)
+
+    last_date = returns_total.index[-1]
+    raw_w = bl.get_black_litterman_weights(last_date)
+
+    if raw_w is None or len(raw_w) == 0:
+        raise ValueError("Le modèle quarterly BL a retourné des poids vides.")
+
+    raw_weights = {
+        t.replace("=X", ""): float(w)
+        for t, w in zip(requested_tickers, raw_w)
+    }
+
+    final_weights = _normalize_weights(raw_weights, [t.replace("=X", "") for t in requested_tickers])
+
+    latest_ret = returns_total.loc[last_date]
+
     rows: List[AllocationRow] = []
-
-    for pair, weight in zip(pairs, w):
+    for pair in [t.replace("=X", "") for t in requested_tickers]:
+        weight = final_weights.get(pair, 0.0)
         notional = weight * initial_capital
+
+        ticker = f"{pair}=X"
+        pair_ret = float(latest_ret.get(ticker, 0.0))
+
+        market_value = notional * (1 + pair_ret)
+        pnl_today = notional * pair_ret
+        pnl_total = market_value - notional
+
         rows.append(
             AllocationRow(
                 pair=pair,
                 weight=round(weight * 100, 2),
                 notional=round(notional, 2),
-                market_value=round(notional, 2),
-                pnl_today=0.0,
-                pnl_total=0.0,
+                market_value=round(market_value, 2),
+                pnl_today=round(pnl_today, 2),
+                pnl_total=round(pnl_total, 2),
             )
         )
 
     total_mv = sum(r.market_value for r in rows)
+    daily = sum(r.pnl_today for r in rows)
+    cum = sum(r.pnl_total for r in rows)
     hhi = sum((r.weight / 100) ** 2 for r in rows)
 
     kpi = KpiSummary(
         total_value=round(total_mv, 2),
-        daily_pnl=0.0,
-        cumulative_pnl=0.0,
-        net_exposure_usd=round(total_mv, 2),
+        daily_pnl=round(daily, 2),
+        cumulative_pnl=round(cum, 2),
+        net_exposure_usd=round(sum(abs(r.market_value) for r in rows), 2),
         concentration_hhi=round(hhi, 4),
     )
 
