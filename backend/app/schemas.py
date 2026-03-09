@@ -14,6 +14,9 @@ class Horizon(str, Enum):
     CUSTOM = "custom"
 
 class OptModel(str, Enum):
+    WEEKLY_REBALANCE = "weekly_rebalance"
+    MONTHLY_REBALANCE = "monthly_rebalance"
+    QUARTERLY_BL = "quarterly_bl"
     MARKOWITZ = "markowitz"
     ENTROPY_POOLING = "entropy_pooling"
     EQUAL_WEIGHT = "equal_weight"
