@@ -7,15 +7,14 @@ import KpiCard from '@/components/KpiCard';
 import PositionsTable from '@/components/PositionsTable';
 
 const HORIZON_OPTIONS = ['1M', '3M', '6M', '1Y', 'custom'] as const;
-const MODEL_OPTIONS = ['markowitz', 'entropy_pooling', 'equal_weight', 'risk_parity'] as const;
+const MODEL_OPTIONS = ['weekly_rebalance', 'monthly_rebalance', 'quarterly_bl'] as const;
 const RISK_OPTIONS = ['low', 'medium', 'high'] as const;
 const UNIVERSE_OPTIONS = ['majors', 'minors', 'exotics', 'mix'] as const;
 
 const MODEL_LABELS: Record<string, string> = {
-  markowitz: 'Markowitz MVO',
-  entropy_pooling: 'Entropy Pooling',
-  equal_weight: 'Equal Weight',
-  risk_parity: 'Risk Parity',
+  weekly_rebalance: 'Weekly Rebalancing',
+  monthly_rebalance: 'Monthly Rebalancing',
+  quarterly_bl: 'Quarterly Black-Litterman',
 };
 
 function fmtUsd(n: number) {
@@ -31,7 +30,7 @@ export default function WizardPage() {
   // form state
   const [capital, setCapital] = useState(100000);
   const [horizon, setHorizon] = useState('3M');
-  const [model, setModel] = useState('markowitz');
+  const [model, setModel] = useState('weekly_rebalance');
   const [targetReturn, setTargetReturn] = useState(8);
   const [riskLevel, setRiskLevel] = useState('medium');
   const [universe, setUniverse] = useState('majors');
