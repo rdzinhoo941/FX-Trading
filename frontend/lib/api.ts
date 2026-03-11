@@ -1,4 +1,4 @@
-const BASE = '/api';
+const BASE = 'http://127.0.0.1:8000/api';
 
 export async function apiGet<T>(path: string, params?: Record<string, string>): Promise<T> {
   const url = new URL(path, window.location.origin);

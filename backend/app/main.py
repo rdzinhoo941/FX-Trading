@@ -2,11 +2,19 @@
 FastAPI backend for FX Portfolio Optimizer.
 Run with: uvicorn app.main:app --reload --port 8000
 """
-from typing import Dict
 
 import uuid
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+from typing import Dict
+
+SESSIONS: Dict[str, dict] = {}
+
+def _get_session(session_id: str) -> dict:
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SESSIONS[session_id]
 
 from app.schemas import (
     ProfileRequest, ProfileResponse,
@@ -17,6 +25,7 @@ from app.schemas import (
     BacktestResponse,
     CorrelationResponse,
     SessionAction, TopBarParams,
+    AllocationRow, KpiSummary,
 )
 from app.services.data_service import get_pairs
 from app.services.optimization_service import generate_allocation
@@ -39,61 +48,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── In-memory session store ───────────────────────────────────────────────────
-sessions: Dict[str, dict] = {}
-
-
-def _get_session(session_id: str) -> dict:
-    if session_id not in sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return sessions[session_id]
-
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.post("/api/profile/generate_portfolio", response_model=ProfileResponse)
+@app.post("/api/profile/generate_portfolio")
 def generate_portfolio(req: ProfileRequest):
-    sid = str(uuid.uuid4())
-    pairs = get_pairs(req.fx_universe.value)
-    allocation, kpi = generate_allocation(
-        pairs=pairs,
-        initial_capital=req.initial_capital,
-        model=req.optimization_model.value,
-        target_return_pct=req.target_return_pct,
-        risk_aversion=req.risk_aversion_level.value,
-    )
-    sessions[sid] = {
-        "profile": req.model_dump(),
-        "pairs": pairs,
-        "allocation": allocation,
-        "kpi": kpi,
-        "initial_capital": req.initial_capital,
-    }
-    return ProfileResponse(session_id=sid, allocation=allocation, kpi=kpi)
+    try:
+        print("DEBUG 1 - request received")
 
+        pairs = [
+            "EUR/USD",
+            "USD/JPY",
+            "GBP/USD",
+            "USD/CHF",
+            "AUD/USD",
+            "USD/CAD",
+            "NZD/USD",
+        ]
+        print("DEBUG 2 - pairs:", pairs)
+
+        allocation, kpi = generate_allocation(
+            pairs=pairs,
+            initial_capital=req.initial_capital,
+            model=req.optimization_model,
+            target_return_pct=req.target_return_pct,
+            risk_aversion=req.risk_aversion_level,
+        )
+        print("DEBUG 3 - allocation generated")
+        print("DEBUG 3bis - allocation len:", len(allocation))
+        print("DEBUG 3ter - kpi:", kpi)
+
+        import uuid
+        session_id = str(uuid.uuid4())
+
+        SESSIONS[session_id] = {
+    "profile": req.model_dump(),
+    "pairs": pairs,
+    "initial_capital": req.initial_capital,
+    "allocation": [row.model_dump() for row in allocation],
+    "kpi": kpi.model_dump(),
+        }	
+
+        print("DEBUG 4 - before response")
+
+        response = {
+            "session_id": session_id,
+            "allocation": [row.model_dump() for row in allocation],
+            "kpi": kpi.model_dump(),
+        }
+
+        return response
+
+    except Exception as e:
+        import traceback
+        print("DEBUG ERROR:", repr(e))
+        traceback.print_exc()
+        raise
 
 @app.get("/api/portfolio/summary", response_model=PortfolioSummary)
 def portfolio_summary(session_id: str):
     s = _get_session(session_id)
-    from app.services.results_service import load_nav_series
 
-    nav_data = load_nav_series("markowitz")
-    
+    allocation = [
+    row if isinstance(row, AllocationRow) else AllocationRow(**row)
+    for row in s["allocation"]
+    ]
+    kpi = s["kpi"] if isinstance(s["kpi"], KpiSummary) else KpiSummary(**s["kpi"])
+
     nav_series = [
-        NavPoint(
-            date=item["date"],
-            nav=round(item["value"], 4),
-            peak=round(item["value"], 4)
-        )
-        for item in nav_data
+    NavPoint(date="2024-12-28", nav=100000.0, peak=100000.0),
+    NavPoint(date="2024-12-29", nav=100250.0, peak=100250.0),
+    NavPoint(date="2024-12-30", nav=99850.0, peak=100250.0),
+    NavPoint(date="2024-12-31", nav=100400.0, peak=100400.0),
+    NavPoint(date="2025-01-01", nav=round(kpi.total_value, 4), peak=max(100400.0, round(kpi.total_value, 4))),
     ]
 
     return PortfolioSummary(
-        allocation=s["allocation"],
-        kpi=s["kpi"],
+        allocation=allocation,
+        kpi=kpi,
         nav_series=nav_series,
     )
-
 
 @app.post("/api/portfolio/rebalance", response_model=ProfileResponse)
 def rebalance(body: SessionAction):
@@ -115,13 +148,14 @@ def rebalance(body: SessionAction):
 @app.post("/api/forecasts/recompute", response_model=ForecastResponse)
 def recompute_forecasts(body: SessionAction):
     s = _get_session(body.session_id)
-    return generate_forecast(nav_last=s["kpi"].total_value, seed=np.random.randint(0, 10000))
+    return generate_forecast(nav_last=s["kpi"]["total_value"], seed=np.random.randint(0, 10000))
 
 
 @app.get("/api/forecasts", response_model=ForecastResponse)
 def get_forecasts(session_id: str):
     s = _get_session(session_id)
-    return generate_forecast(nav_last=s["kpi"].total_value)
+    nav_last = s["kpi"].total_value if isinstance(s["kpi"], KpiSummary) else s["kpi"]["total_value"]
+    return generate_forecast(nav_last=nav_last)
 
 
 @app.get("/api/risk/metrics", response_model=RiskResponse)
