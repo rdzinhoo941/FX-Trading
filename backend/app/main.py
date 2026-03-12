@@ -55,15 +55,48 @@ def generate_portfolio(req: ProfileRequest):
     try:
         print("DEBUG 1 - request received")
 
-        pairs = [
-            "EUR/USD",
-            "USD/JPY",
-            "GBP/USD",
-            "USD/CHF",
-            "AUD/USD",
-            "USD/CAD",
-            "NZD/USD",
-        ]
+        fx_universe = req.fx_universe.value if hasattr(req.fx_universe, "value") else str(req.fx_universe)
+
+        if fx_universe == "majors":
+            pairs = [
+                "EUR/USD",
+                "USD/JPY",
+                "GBP/USD",
+                "USD/CHF",
+                "AUD/USD",
+                "USD/CAD",
+                "NZD/USD",
+            ]
+        elif fx_universe == "minors":
+            pairs = [
+                "EUR/GBP",
+                "EUR/JPY",
+                "AUD/JPY",
+                "NZD/JPY",
+            ]
+        elif fx_universe == "exotics":
+            pairs = [
+                "USD/TRY",
+                "USD/ZAR",
+                "USD/MXN",
+                "USD/SGD",
+                "USD/NOK",
+                "USD/SEK",
+            ]
+        else:  # mix
+            pairs = [
+                "EUR/USD",
+                "USD/JPY",
+                "GBP/USD",
+                "AUD/USD",
+                "EUR/JPY",
+                "AUD/JPY",
+                "USD/ZAR",
+                "USD/MXN",
+            ]
+
+        print("DEBUG fx_universe:", fx_universe)
+        print("DEBUG selected pairs:", pairs)
         print("DEBUG 2 - pairs:", pairs)
 
         allocation, kpi = generate_allocation(
@@ -104,23 +137,124 @@ def generate_portfolio(req: ProfileRequest):
         traceback.print_exc()
         raise
 
+from pathlib import Path
+import pandas as pd
+
+
+def _build_dynamic_nav_series(allocation, initial_capital: float, lookback_days: int = 90):
+    """
+    Build a dynamic NAV series from current portfolio weights applied
+    to recent historical daily FX returns.
+
+    This is not a full backtest with rolling rebalancing.
+    It is a dynamic historical NAV based on the portfolio's current weights.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+
+    prices_candidates = [
+        repo_root / "data" / "data_forex_prices.csv",
+        repo_root / "data_forex_prices.csv",
+    ]
+    prices_path = next((p for p in prices_candidates if p.exists()), None)
+
+    if prices_path is None:
+        raise FileNotFoundError("Could not find data_forex_prices.csv")
+
+    prices = pd.read_csv(prices_path, index_col=0, parse_dates=True).sort_index()
+
+    weight_map = {}
+    for row in allocation:
+        pair = row.pair if hasattr(row, "pair") else row["pair"]
+        weight_pct = row.weight if hasattr(row, "weight") else row["weight"]
+        ticker = f"{pair}=X"
+        if ticker in prices.columns:
+            weight_map[ticker] = float(weight_pct) / 100.0
+
+    if not weight_map:
+        return [
+            NavPoint(
+                date="2025-01-01",
+                nav=round(initial_capital, 4),
+                peak=round(initial_capital, 4),
+            )
+        ]
+
+    selected_prices = prices[list(weight_map.keys())].dropna(how="all").ffill().dropna()
+
+    if len(selected_prices) < 2:
+        return [
+            NavPoint(
+                date="2025-01-01",
+                nav=round(initial_capital, 4),
+                peak=round(initial_capital, 4),
+            )
+        ]
+
+    selected_prices = selected_prices.tail(lookback_days)
+    returns = selected_prices.pct_change().dropna()
+
+    weights = pd.Series(weight_map)
+    weights = weights.reindex(returns.columns).fillna(0.0)
+
+    portfolio_returns = returns.mul(weights, axis=1).sum(axis=1)
+
+    nav = initial_capital * (1 + portfolio_returns).cumprod()
+    peak = nav.cummax()
+
+    nav_series = [
+        NavPoint(
+            date=dt.strftime("%Y-%m-%d"),
+            nav=round(float(nv), 4),
+            peak=round(float(pk), 4),
+        )
+        for dt, nv, pk in zip(nav.index, nav.values, peak.values)
+    ]
+
+    return nav_series
+
+
+def _horizon_to_lookback_days(horizon) -> int:
+    """
+    Map profile horizon to approximate trading days.
+    """
+    h = horizon.value if hasattr(horizon, "value") else str(horizon)
+
+    if h == "1M":
+        return 21
+    elif h == "3M":
+        return 63
+    elif h == "6M":
+        return 126
+    elif h == "1Y":
+        return 252
+    else:
+        return 90
+
 @app.get("/api/portfolio/summary", response_model=PortfolioSummary)
 def portfolio_summary(session_id: str):
     s = _get_session(session_id)
 
     allocation = [
-    row if isinstance(row, AllocationRow) else AllocationRow(**row)
-    for row in s["allocation"]
+        row if isinstance(row, AllocationRow) else AllocationRow(**row)
+        for row in s["allocation"]
     ]
     kpi = s["kpi"] if isinstance(s["kpi"], KpiSummary) else KpiSummary(**s["kpi"])
 
-    nav_series = [
-    NavPoint(date="2024-12-28", nav=100000.0, peak=100000.0),
-    NavPoint(date="2024-12-29", nav=100250.0, peak=100250.0),
-    NavPoint(date="2024-12-30", nav=99850.0, peak=100250.0),
-    NavPoint(date="2024-12-31", nav=100400.0, peak=100400.0),
-    NavPoint(date="2025-01-01", nav=round(kpi.total_value, 4), peak=max(100400.0, round(kpi.total_value, 4))),
-    ]
+    initial_capital = s.get("initial_capital", 100000.0)
+
+    profile = s.get("profile", {})
+    horizon = profile.get("horizon", "3M") if isinstance(profile, dict) else "3M"
+    lookback_days = _horizon_to_lookback_days(horizon)
+
+    print("DEBUG profile in session:", profile)
+    print("DEBUG horizon used:", horizon)
+    print("DEBUG lookback_days used:", lookback_days)
+
+    nav_series = _build_dynamic_nav_series(
+        allocation,
+        initial_capital=initial_capital,
+        lookback_days=lookback_days,
+    )
 
     return PortfolioSummary(
         allocation=allocation,
