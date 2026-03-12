@@ -145,11 +145,16 @@ def rebalance(body: SessionAction):
     return ProfileResponse(session_id=body.session_id, allocation=allocation, kpi=kpi)
 
 
-@app.post("/api/forecasts/recompute", response_model=ForecastResponse)
-def recompute_forecasts(body: SessionAction):
-    s = _get_session(body.session_id)
-    return generate_forecast(nav_last=s["kpi"]["total_value"], seed=np.random.randint(0, 10000))
+@app.post("/api/forecasts/recompute")
+def recompute_forecasts(req: SessionAction):
+    s = _get_session(req.session_id)
 
+    nav_last = s["kpi"].total_value if isinstance(s["kpi"], KpiSummary) else s["kpi"]["total_value"]
+
+    return generate_forecast(
+        nav_last=nav_last,
+        seed=np.random.randint(0, 10000),
+    )
 
 @app.get("/api/forecasts", response_model=ForecastResponse)
 def get_forecasts(session_id: str):

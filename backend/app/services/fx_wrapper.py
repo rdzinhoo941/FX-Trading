@@ -265,99 +265,210 @@ def run_quarterly_bl_allocation(
     risk_aversion: str,
 ) -> tuple[List[AllocationRow], KpiSummary]:
     """
-    Wrapper API pour le script 'B-L momentum for assets and rates.py'.
+    Quarterly Black-Litterman allocation compatible with the backend API.
 
-    On reconstruit les poids BL à la dernière date disponible,
-    puis on les convertit au format attendu par l'API.
+    Logic kept from the research script:
+    - FX total returns = price return + carry
+    - momentum-based views
+    - covariance-based prior
+    - BL posterior expected returns
+    - constrained optimization
     """
-    repo_root = Path(__file__).resolve().parents[3]
-    bl_path = repo_root / "B-L momentum for assets and rates.py"
 
-    if not bl_path.exists():
+    from pathlib import Path
+    import numpy as np
+    import pandas as pd
+    from scipy.optimize import minimize
+
+    repo_root = Path(__file__).resolve().parents[3]
+
+    # Accept either /data or root-level files
+    prices_candidates = [
+        repo_root / "data" / "data_forex_prices.csv",
+        repo_root / "data_forex_prices.csv",
+    ]
+    rates_candidates = [
+        repo_root / "data" / "data_fred_rates.csv",
+        repo_root / "data_fred_rates.csv",
+    ]
+
+    prices_path = next((p for p in prices_candidates if p.exists()), None)
+    rates_path = next((p for p in rates_candidates if p.exists()), None)
+
+    if prices_path is None or rates_path is None:
         raise FileNotFoundError(
-            f"B-L momentum for assets and rates.py introuvable: {bl_path}"
+            "Could not find data_forex_prices.csv / data_fred_rates.csv "
+            "either in /data or at repo root."
         )
 
-    bl = _load_module_from_path("bl_momentum_runtime", bl_path)
+    prices = pd.read_csv(prices_path, index_col=0, parse_dates=True).sort_index()
+    rates_daily = pd.read_csv(rates_path, index_col=0, parse_dates=True).sort_index()
 
-    # Chargement local des données depuis /data
-    prices = pd.read_csv(repo_root / "data" / "data_forex_prices.csv", index_col=0, parse_dates=True)
-    rates_daily = pd.read_csv(repo_root / "data" / "data_fred_rates.csv", index_col=0, parse_dates=True)
+    normalized_pairs = _normalize_fx_pairs_for_framework(pairs)
+    if not normalized_pairs:
+        raise ValueError("No valid FX pairs provided for quarterly BL allocation.")
 
-    common_idx = prices.index.intersection(rates_daily.index)
-    prices = prices.loc[common_idx]
-    rates_daily = rates_daily.loc[common_idx]
-
-    prices = prices.loc["2015-01-01":]
-    rates_daily = rates_daily.loc["2015-01-01":]
-
-    # Restriction aux paires demandées par l'interface
-    requested_tickers = []
-    for pair in pairs:
-        ticker = f"{pair}=X"
-        if ticker in prices.columns:
-            requested_tickers.append(ticker)
-
+    requested_tickers = [f"{p}=X" for p in normalized_pairs if f"{p}=X" in prices.columns]
     if not requested_tickers:
-        raise ValueError("Aucune paire valide pour le modèle quarterly BL.")
+        raise ValueError("Requested FX pairs are not available in the price dataset.")
 
-    prices = prices[requested_tickers]
+    prices = prices[requested_tickers].dropna(how="all")
 
-    # Recréation des returns_total et momentum_score comme dans le script BL
+    # Align indices
+    common_idx = prices.index.intersection(rates_daily.index)
+    prices = prices.loc[common_idx].ffill().dropna(how="all")
+    rates_daily = rates_daily.loc[common_idx].ffill()
+
+    if len(prices) < 260:
+        raise ValueError("Not enough historical data for quarterly BL allocation.")
+
+    # -----------------------------
+    # Parameters inspired by teammate's BL interface version
+    # -----------------------------
+    LOOKBACK_MOMENTUM = 252   # 12 months
+    LOOKBACK_COV = 252
+    BROKER_SWAP_MARKUP = 0.0001
+    TAU = 0.05
+    MAX_WEIGHT = 0.50
+    GROSS_LEVERAGE = 1.50
+
+    # Higher delta = more risk aversion
+    delta_map = {
+        "low": 4.0,
+        "medium": 2.5,
+        "high": 1.5,
+    }
+    delta = delta_map.get(str(risk_aversion).lower(), 2.5)
+
+    def parse_pair_ticker(ticker: str) -> tuple[str, str]:
+        x = ticker.replace("=X", "")
+        return x[:3], x[3:]
+
+    # -----------------------------
+    # Total returns = price return + carry
+    # -----------------------------
     returns_total = pd.DataFrame(index=prices.index, columns=requested_tickers, dtype=float)
-    momentum_score = pd.DataFrame(index=prices.index, columns=requested_tickers, dtype=float)
 
-    for t in requested_tickers:
-        base, quote = bl.parse_pair(t)
+    for ticker in requested_tickers:
+        base, quote = parse_pair_ticker(ticker)
 
-        r_price = prices[t].pct_change()
+        price_ret = prices[ticker].pct_change()
 
-        r_carry = 0.0
+        carry_ret = 0.0
         if base in rates_daily.columns and quote in rates_daily.columns:
             raw_diff = rates_daily[base] - rates_daily[quote]
-            realistic_diff = raw_diff - bl.BROKER_SWAP_MARKUP
-            r_carry = realistic_diff / 252.0
+            realistic_diff = raw_diff - BROKER_SWAP_MARKUP
+            carry_ret = realistic_diff / 252.0
 
-        returns_total[t] = r_price + r_carry
+        returns_total[ticker] = price_ret + carry_ret
 
-        log_rets = np.log(1 + returns_total[t])
-        momentum_score[t] = log_rets.rolling(bl.LOOKBACK_MOMENTUM).sum().shift(1)
+    returns_total = returns_total.dropna(how="all")
+    if len(returns_total) < LOOKBACK_COV + 5:
+        raise ValueError("Not enough total return history for quarterly BL.")
 
-    returns_total.dropna(inplace=True)
-    momentum_score.dropna(inplace=True)
+    # -----------------------------
+    # Quarterly-style momentum views
+    # Use 12m momentum but rebalance on the latest available date
+    # -----------------------------
+    log_total = np.log1p(returns_total.clip(lower=-0.999999))
+    momentum_score = log_total.rolling(LOOKBACK_MOMENTUM).sum().shift(1)
+    momentum_score = momentum_score.dropna(how="all")
 
-    start_bt = "2018-01-01"
-    returns_total = returns_total.loc[start_bt:]
-    momentum_score = momentum_score.loc[start_bt:]
-    prices = prices.loc[start_bt:]
+    if momentum_score.empty:
+        raise ValueError("Momentum score could not be computed for quarterly BL.")
 
-    if returns_total.empty or momentum_score.empty:
-        raise ValueError("Pas assez de données pour calculer les poids quarterly BL.")
+    last_date = momentum_score.index[-1]
+    views_raw = momentum_score.loc[last_date].fillna(0.0)
 
-    # On injecte les objets globaux attendus par get_black_litterman_weights
-    bl.returns_total = returns_total
-    bl.momentum_score = momentum_score
+    # Normalize views cross-sectionally
+    if views_raw.std() > 1e-12:
+        views_z = (views_raw - views_raw.mean()) / views_raw.std()
+    else:
+        views_z = views_raw * 0.0
 
-    # Ajustement simple selon le niveau de risque utilisateur
-    risk_map = {
-        "low": 1.5,
-        "medium": 2.5,
-        "high": 4.0,
-    }
-    bl.RISK_AVERSION_DELTA = risk_map.get((risk_aversion or "").lower(), 2.5)
+    # Convert to expected return tilts (keep realistic magnitude)
+    Q = (views_z.clip(-2, 2) * 0.02).values.reshape(-1, 1)
 
-    last_date = returns_total.index[-1]
-    raw_w = bl.get_black_litterman_weights(last_date)
+    # -----------------------------
+    # Covariance
+    # -----------------------------
+    cov_window = returns_total.loc[:last_date].tail(LOOKBACK_COV)
+    Sigma = cov_window.cov().values
+    n = len(requested_tickers)
+    Sigma = Sigma + 1e-6 * np.eye(n)
 
-    if raw_w is None or len(raw_w) == 0:
-        raise ValueError("Le modèle quarterly BL a retourné des poids vides.")
+    # -----------------------------
+    # Prior / equilibrium returns
+    # -----------------------------
+    w_eq = np.ones(n) / n
+    pi = delta * Sigma @ w_eq
+
+    # -----------------------------
+    # Black-Litterman posterior
+    # -----------------------------
+    P = np.eye(n)
+    omega_diag = np.maximum(np.diag(P @ (TAU * Sigma) @ P.T), 1e-6)
+    Omega = np.diag(omega_diag)
+
+    inv_tau_sigma = np.linalg.inv(TAU * Sigma)
+    inv_omega = np.linalg.inv(Omega)
+
+    posterior_cov = np.linalg.inv(inv_tau_sigma + P.T @ inv_omega @ P)
+    posterior_mean = posterior_cov @ (
+        inv_tau_sigma @ pi.reshape(-1, 1) + P.T @ inv_omega @ Q
+    )
+    mu_bl = posterior_mean.flatten()
+
+    # -----------------------------
+    # Constrained optimization
+    # -----------------------------
+    def objective(w: np.ndarray) -> float:
+        expected_term = mu_bl @ w
+        risk_term = 0.5 * delta * (w @ Sigma @ w)
+        return -(expected_term - risk_term)
+
+    constraints = [
+        {"type": "ineq", "fun": lambda w: GROSS_LEVERAGE - np.sum(np.abs(w))}
+    ]
+    bounds = [(-MAX_WEIGHT, MAX_WEIGHT) for _ in range(n)]
+    x0 = np.ones(n) / n
+
+    res = minimize(
+        objective,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 300, "ftol": 1e-9},
+    )
+
+    if res.success:
+        raw_w = res.x
+    else:
+        # fallback to normalized views if optimization fails
+        raw_w = views_z.values.astype(float)
+        gross = np.sum(np.abs(raw_w))
+        if gross <= 1e-12:
+            raw_w = np.ones(n) / n
+        else:
+            raw_w = raw_w / gross
+        raw_w = np.clip(raw_w, -MAX_WEIGHT, MAX_WEIGHT)
+
+    gross = np.sum(np.abs(raw_w))
+    if gross <= 1e-12:
+        raw_w = np.ones(n) / n
+    elif gross > GROSS_LEVERAGE:
+        raw_w = raw_w * (GROSS_LEVERAGE / gross)
 
     raw_weights = {
-        t.replace("=X", ""): float(w)
-        for t, w in zip(requested_tickers, raw_w)
+        ticker.replace("=X", ""): float(w)
+        for ticker, w in zip(requested_tickers, raw_w)
     }
 
-    final_weights = _normalize_weights(raw_weights, [t.replace("=X", "") for t in requested_tickers])
+    final_weights = _normalize_weights(
+        raw_weights,
+        [t.replace("=X", "") for t in requested_tickers]
+    )
 
     latest_ret = returns_total.loc[last_date]
 
